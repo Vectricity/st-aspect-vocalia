@@ -1,6 +1,6 @@
-# Aspect: Evolutia
+# Aspect: Vocalia
 
-Aspect: Evolutia is a SillyTavern extension for intelligently automating character responses in group chats.
+Aspect: Vocalia is a SillyTavern extension for intelligently automating character responses in group chats.
 
 ## Presence
 Controls character presence (arrival, departure, idling, and speaking).
