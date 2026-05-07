@@ -1,6 +1,7 @@
 {
   "display_name": "Aspect: Vocalia",
-  "loading_order": 1,
+  "loading_order": 1000,
+  "generate_interceptor": "aspectVocaliaGenerateInterceptor",
   "requires": [],
   "optional": [],
   "js": "index.js",
