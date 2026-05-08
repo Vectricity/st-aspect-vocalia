@@ -50,6 +50,12 @@ const MEMBER_STATUS_DEPARTING = 'departing';
 const OVERLAY_STYLE_PLAIN = 'plain';
 const OVERLAY_STYLE_ITALIC = 'italic';
 const OVERLAY_STYLE_ASTERISKS = 'asterisks';
+const OVERLAY_STYLE_BOLD = 'bold';
+const OVERLAY_STYLE_BOLD_ITALIC = 'bold_italic';
+const OVERLAY_STYLE_UNDERLINE = 'underline';
+const OVERLAY_STYLE_STRIKE = 'strike';
+const OVERLAY_STYLE_UPPERCASE = 'uppercase';
+const OVERLAY_STYLE_LOWERCASE = 'lowercase';
 
 const SEGMENT_DIALOGUE = 'dialogue';
 const SEGMENT_ACTIONS = 'actions';
@@ -3459,6 +3465,7 @@ function firstValidOwnerBlock(blocks, message) {
 // - Preserve raw structured content in chat history.
 // - Render parsed blocks as semantic HTML.
 // - Respect ordered dialogue/actions/narration/thoughts segments.
+// - Support refined-message display styles from drawer settings.
 // - Use SillyTavern's own messageFormatting() only as a leaf renderer for
 //   explicit quote/asterisk-wrapped segment display.
 // - Avoid passing the full reconstructed message through Markdown as one blob.
@@ -3495,15 +3502,48 @@ function buildDialogueDisplayText(value) {
     return getSettings().quoteDialogue ? `"${text}"` : text;
 }
 
+function normalizeOverlayStyle(style) {
+    const value = String(style ?? '').trim();
+
+    if (value === 'none') return OVERLAY_STYLE_PLAIN;
+    if (value === 'muted_italics') return OVERLAY_STYLE_ASTERISKS;
+
+    const allowed = new Set([
+        OVERLAY_STYLE_PLAIN,
+        OVERLAY_STYLE_ITALIC,
+        OVERLAY_STYLE_ASTERISKS,
+        OVERLAY_STYLE_BOLD,
+        OVERLAY_STYLE_BOLD_ITALIC,
+        OVERLAY_STYLE_UNDERLINE,
+        OVERLAY_STYLE_STRIKE,
+        OVERLAY_STYLE_UPPERCASE,
+        OVERLAY_STYLE_LOWERCASE,
+    ]);
+
+    return allowed.has(value) ? value : OVERLAY_STYLE_PLAIN;
+}
+
 function buildStyledSegmentDisplayText(value, displayStyle) {
     const text = normalizePlainSegmentText(value);
     if (!text) return '';
 
-    switch (displayStyle) {
+    const normalizedStyle = normalizeOverlayStyle(displayStyle);
+
+    switch (normalizedStyle) {
         case OVERLAY_STYLE_ASTERISKS:
             return `*${text}*`;
 
+        case OVERLAY_STYLE_UPPERCASE:
+            return text.toLocaleUpperCase();
+
+        case OVERLAY_STYLE_LOWERCASE:
+            return text.toLocaleLowerCase();
+
+        case OVERLAY_STYLE_BOLD:
+        case OVERLAY_STYLE_BOLD_ITALIC:
         case OVERLAY_STYLE_ITALIC:
+        case OVERLAY_STYLE_UNDERLINE:
+        case OVERLAY_STYLE_STRIKE:
         case OVERLAY_STYLE_PLAIN:
         default:
             return text;
@@ -3515,7 +3555,23 @@ function shouldUseSillyTavernFormattingForSegment(segmentType, displayStyle) {
         return !!getSettings().quoteDialogue;
     }
 
-    return displayStyle === OVERLAY_STYLE_ASTERISKS;
+    return normalizeOverlayStyle(displayStyle) === OVERLAY_STYLE_ASTERISKS;
+}
+
+function shouldShowRefinedCharacterName(settings = getSettings()) {
+    if (Object.hasOwn(settings, 'hideCharacterNameInRefinedMessage')) {
+        return !Boolean(settings.hideCharacterNameInRefinedMessage);
+    }
+
+    return !!settings.showCharacterLabels;
+}
+
+function shouldShowRefinedThoughts(settings = getSettings()) {
+    if (Object.hasOwn(settings, 'hideThoughtsInRefinedMessage')) {
+        return !Boolean(settings.hideThoughtsInRefinedMessage);
+    }
+
+    return !!settings.showThoughts;
 }
 
 function createOverlaySpan(className, text) {
@@ -3573,12 +3629,13 @@ function appendSegmentElement(parent, segment, block, message, messageId) {
         }
 
         case SEGMENT_ACTIONS: {
-            const displayText = buildStyledSegmentDisplayText(rawText, settings.actionDisplayStyle);
+            const displayStyle = normalizeOverlayStyle(settings.actionDisplayStyle);
+            const displayText = buildStyledSegmentDisplayText(rawText, displayStyle);
             if (!displayText) return;
 
-            paragraph.dataset.displayStyle = settings.actionDisplayStyle;
+            paragraph.dataset.displayStyle = displayStyle;
 
-            if (shouldUseSillyTavernFormattingForSegment(segment.type, settings.actionDisplayStyle)) {
+            if (shouldUseSillyTavernFormattingForSegment(segment.type, displayStyle)) {
                 paragraph.append(createFormattedSegmentElement('aspect-vocalia-actions', displayText, message, messageId));
             } else {
                 paragraph.append(createOverlaySpan('aspect-vocalia-actions', displayText));
@@ -3588,12 +3645,13 @@ function appendSegmentElement(parent, segment, block, message, messageId) {
         }
 
         case SEGMENT_NARRATION: {
-            const displayText = buildStyledSegmentDisplayText(rawText, settings.narrationDisplayStyle);
+            const displayStyle = normalizeOverlayStyle(settings.narrationDisplayStyle);
+            const displayText = buildStyledSegmentDisplayText(rawText, displayStyle);
             if (!displayText) return;
 
-            paragraph.dataset.displayStyle = settings.narrationDisplayStyle;
+            paragraph.dataset.displayStyle = displayStyle;
 
-            if (shouldUseSillyTavernFormattingForSegment(segment.type, settings.narrationDisplayStyle)) {
+            if (shouldUseSillyTavernFormattingForSegment(segment.type, displayStyle)) {
                 paragraph.append(createFormattedSegmentElement('aspect-vocalia-narration', displayText, message, messageId));
             } else {
                 paragraph.append(createOverlaySpan('aspect-vocalia-narration', displayText));
@@ -3603,14 +3661,15 @@ function appendSegmentElement(parent, segment, block, message, messageId) {
         }
 
         case SEGMENT_THOUGHTS: {
-            if (!settings.showThoughts) return;
+            if (!shouldShowRefinedThoughts(settings)) return;
 
-            const displayText = buildStyledSegmentDisplayText(rawText, settings.thoughtsDisplayStyle);
+            const displayStyle = normalizeOverlayStyle(settings.thoughtsDisplayStyle);
+            const displayText = buildStyledSegmentDisplayText(rawText, displayStyle);
             if (!displayText) return;
 
-            paragraph.dataset.displayStyle = settings.thoughtsDisplayStyle;
+            paragraph.dataset.displayStyle = displayStyle;
 
-            if (shouldUseSillyTavernFormattingForSegment(segment.type, settings.thoughtsDisplayStyle)) {
+            if (shouldUseSillyTavernFormattingForSegment(segment.type, displayStyle)) {
                 paragraph.append(createFormattedSegmentElement('aspect-vocalia-thoughts', displayText, message, messageId));
             } else {
                 paragraph.append(createOverlaySpan('aspect-vocalia-thoughts', displayText));
@@ -3632,7 +3691,7 @@ function createBlockOverlayElement(block, message, messageId) {
     const blockElement = document.createElement('div');
     blockElement.className = 'aspect-vocalia-block';
 
-    if (settings.showCharacterLabels) {
+    if (shouldShowRefinedCharacterName(settings)) {
         const label = document.createElement('div');
         label.className = 'aspect-vocalia-character-label';
         label.textContent = block.name;
@@ -3681,94 +3740,69 @@ function getMessageElementAndTextElement(messageId) {
     };
 }
 
-function formatMessageForDisplay(message, text, messageId) {
-    const context = ctx();
-
-    if (typeof context.messageFormatting === 'function') {
-        return context.messageFormatting(
-            text,
-            message.name,
-            !!message.is_system,
-            !!message.is_user,
-            Number(messageId),
-        );
-    }
-
-    return escapeHtml(text).replace(/\n/g, '<br>');
-}
-
-function restoreRawMessageDisplay(messageId) {
-    const context = ctx();
-    const id = Number(messageId);
-    const message = context.chat?.[id];
-
-    if (!message) return;
-
-    const { messageElement, textElement, exists } = getMessageElementAndTextElement(id);
+function resetMessageOverlay(messageId) {
+    const { messageElement, textElement, exists } = getMessageElementAndTextElement(messageId);
     if (!exists) return;
 
-    try {
-        textElement.html(formatMessageForDisplay(message, String(message.mes ?? ''), id));
-    } catch (error) {
-        warn('Failed to restore raw message display.', error);
-        textElement.html(escapeHtml(message.mes ?? '').replace(/\n/g, '<br>'));
+    const originalHtml = textElement.attr('data-aspect-vocalia-original-html');
+
+    if (originalHtml !== undefined) {
+        textElement.html(originalHtml);
+        textElement.removeAttr('data-aspect-vocalia-original-html');
     }
 
     messageElement.removeAttr('data-aspect-vocalia-rendered');
-    messageElement.removeAttr('data-gsr-rendered');
-}
-
-function restoreAllVisibleRawMessages() {
-    $('#chat .mes').each((_index, element) => {
-        const id = Number($(element).attr('mesid'));
-        if (Number.isInteger(id)) restoreRawMessageDisplay(id);
-    });
 }
 
 function renderMessageOverlay(messageId) {
     const settings = getSettings();
-    const context = ctx();
-    const id = Number(messageId);
-    const message = context.chat?.[id];
+    const message = ctx().chat?.[Number(messageId)];
 
     if (!message || message.is_user || message.is_system) return;
 
-    if (!settings.enabled || !settings.renderOverlay) {
-        restoreRawMessageDisplay(id);
+    if (!settings.renderOverlay) {
+        resetMessageOverlay(messageId);
         return;
     }
 
-    const fragment = createStructuredOverlayFragment(message, id);
-    if (fragment === null) return;
-
-    const { messageElement, textElement, exists } = getMessageElementAndTextElement(id);
+    const { messageElement, textElement, exists } = getMessageElementAndTextElement(messageId);
     if (!exists) return;
 
-    try {
-        textElement.empty();
-        textElement[0].append(fragment);
-        messageElement.attr('data-aspect-vocalia-rendered', 'true');
-        messageElement.removeAttr('data-gsr-rendered');
-    } catch (error) {
-        warn('Failed to render semantic overlay.', error);
-        restoreRawMessageDisplay(id);
+    const fragment = createStructuredOverlayFragment(message, messageId);
+    if (!fragment) {
+        resetMessageOverlay(messageId);
+        return;
     }
+
+    if (textElement.attr('data-aspect-vocalia-original-html') === undefined) {
+        textElement.attr('data-aspect-vocalia-original-html', textElement.html());
+    }
+
+    textElement.empty().append(fragment);
+    messageElement.attr('data-aspect-vocalia-rendered', 'true');
 }
 
 function renderAllVisibleOverlays() {
-    if (!getSettings().enabled) return;
+    const chat = ctx().chat ?? [];
 
-    $('#chat .mes').each((_index, element) => {
-        const id = Number($(element).attr('mesid'));
-        if (Number.isInteger(id)) renderMessageOverlay(id);
-    });
+    for (let messageId = 0; messageId < chat.length; messageId += 1) {
+        const message = chat[messageId];
+        if (!message || message.is_user || message.is_system) continue;
+
+        renderMessageOverlay(messageId);
+    }
 }
 
 function applyOverlaySettingToVisibleMessages() {
+    const chat = ctx().chat ?? [];
+
     if (getSettings().renderOverlay) {
         renderAllVisibleOverlays();
-    } else {
-        restoreAllVisibleRawMessages();
+        return;
+    }
+
+    for (let messageId = 0; messageId < chat.length; messageId += 1) {
+        resetMessageOverlay(messageId);
     }
 }
 
@@ -6348,10 +6382,67 @@ async function handleGroupUpdated() {
 // - Bind drawer controls to persistent settings.
 // - Display and manually edit active group member routing status.
 // - Display per-turn trigger allowances for debugging.
+// - Move large Status and Debug Log controls into viewport-constrained popups.
+// - Provide reference-style viewport-constrained info tooltips.
+// - Keep tooltip icons visually attached to wrapped label text.
 // - Style semantic overlay nodes without using Markdown as the structure layer.
 // - Allow selected segments to opt into SillyTavern's own quote/asterisk styling.
-// - Provide start/stop/copy/download debug logging.
+// - Pull footer version and author from manifest.json.
 // ============================================================================
+
+const VOCALIA_DEFAULT_MANIFEST_META = Object.freeze({
+    version: '0.0.0',
+    author: 'Genisai',
+});
+
+const VOCALIA_LABEL_HELP = Object.freeze({
+    critical_controls: 'High-impact controls for turning Vocalia on, resetting current extension state, and opening diagnostics.',
+    enabled: 'Turns Aspect: Vocalia on or off. When disabled, Vocalia stops injecting protocol instructions, routing speakers, intercepting native group generation, and rendering refined messages.',
+    reset_extension: 'Restores Vocalia settings to defaults, clears Vocalia state for the current chat, stops active queues, clears active debug state, and resyncs the current group state.',
+
+    runtime: 'Controls how Vocalia integrates with SillyTavern group generation and speaker triggering.',
+    auto_manual: 'Automatically changes the active group reply strategy to Manual while Vocalia is enabled, preventing native random group speaker selection.',
+    restore_strategy: 'Restores the group reply strategy Vocalia found before it changed the group to Manual.',
+    use_slash_trigger: 'Uses SillyTavern /trigger as the first method for making a selected group member respond.',
+    fallback_generate: 'Falls back to internal force_chid generation if /trigger is unavailable or fails.',
+
+    turn_flow: 'Controls how many group members may participate after one user message and how Vocalia selects first-turn speakers.',
+    arrival_mode: 'Controls whether arriving characters become present immediately or after the current automatic response chain ends.',
+    first_name_match: 'On the first user message of an empty chat, tries to trigger a present, remote, or locally summoned character by exact or unique name match.',
+    first_fallback: 'Controls what Vocalia does on the first message when no character name match or summon is detected.',
+    max_participants: 'Maximum number of assistant participants Vocalia may queue from one parsed routing decision.',
+    max_responses: 'Maximum total automatic assistant responses Vocalia may allow after one user message.',
+    response_delay: 'Delay, in seconds, before Vocalia triggers the next queued assistant response.',
+
+    refined_display: 'Controls how structured Vocalia messages are rendered as readable roleplay text in the chat UI.',
+    render_overlay: 'Displays the raw structured message as a refined readable message without changing the stored chat text.',
+    hide_character_name: 'Hides the active character label in refined messages.',
+    hide_thoughts: 'Hides private [thoughts] segments in refined messages.',
+    quote_dialogue: 'Wraps dialogue in quotes when displaying refined messages.',
+    action_style: 'Visual style applied to [actions] segments.',
+    narration_style: 'Visual style applied to [narration] segments.',
+    thoughts_style: 'Visual style applied to [thoughts] segments.',
+
+    protocol: 'Controls the Vocalia protocol prompt and diagnostic toast behavior.',
+    prompt_depth: 'Depth where Vocalia protocol instructions are injected into the prompt.',
+    hide_debug_toasts: 'Suppresses non-critical Vocalia debug toasts.',
+
+    status_section: 'Opens scene status diagnostics. Present means physically in-scene. Remote means active phone, radio, video, or text contact. Absent means neither present nor remotely connected.',
+    status_popup: 'Shows current scene arrays and lets you manually adjust each group member’s Vocalia status for testing or correction.',
+    status_arrays: 'Current Vocalia scene arrays for the active group chat.',
+    status_member_table: 'Lists every active group member, whether their automatic response allowance has been spent this turn, and their current Vocalia status.',
+    sync_state: 'Rebuilds Vocalia scene state from the active group roster. Useful after changing group members or recovering from mismatched diagnostics.',
+
+    debug_popup: 'Collects a focused diagnostic trace. Start logging, reproduce the issue, then copy or download the log.',
+    debug_status: 'Shows whether debug logging is active, how many entries are buffered, and the start/stop timestamps.',
+    debug_log_controls: 'Start, stop, copy, download, or clear the current debug trace.',
+    dump_state: 'Prints Vocalia settings, chat state, and debug bundle to the browser console.',
+
+    utilities: 'Small one-off tools for refreshing Vocalia display behavior.',
+    render_now: 'Reapplies the current refined-message display setting to visible messages.',
+});
+
+let vocaliaManifestMeta = { ...VOCALIA_DEFAULT_MANIFEST_META };
 
 function injectStyles() {
     if (styleElement) return;
@@ -6370,6 +6461,159 @@ function injectStyles() {
 
         #aspect_vocalia_settings select {
             max-width: 18em;
+        }
+
+        #aspect_vocalia_settings .checkbox_label {
+            align-items: flex-start;
+            line-height: 1.2;
+        }
+
+        #aspect_vocalia_settings .checkbox_label input[type="checkbox"] {
+            margin-top: 0.12em;
+            flex: 0 0 auto;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-settings-box {
+            border: 1px solid #000;
+            border-radius: 10px;
+            padding: 10px;
+            margin: 8px 0;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-settings-tagline {
+            font: inherit;
+            font-size: 0.9em;
+            opacity: 0.75;
+            text-align: right;
+            margin: 0 0 8px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-settings-section {
+            padding: 10px 0;
+            border-top: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15));
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-settings-section:first-of-type {
+            border-top: none;
+            padding-top: 0;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-section-title,
+        #aspect_vocalia_settings .aspect-vocalia-label,
+        #aspect_vocalia_settings .aspect-vocalia-popup-title {
+            font-weight: 600;
+            font-size: 0.95rem;
+            opacity: 0.95;
+            line-height: 1.25;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-section-title,
+        #aspect_vocalia_settings .aspect-vocalia-popup-title {
+            display: inline-block;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-section-title {
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-label,
+        #aspect_vocalia_settings .aspect-vocalia-label-text {
+            display: inline;
+            line-height: 1.25;
+            cursor: pointer;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-box {
+            border: 1px solid rgba(183, 110, 121, 0.65);
+            outline: 1px solid rgba(183, 110, 121, 0.65);
+            outline-offset: 2px;
+            border-radius: 12px;
+            padding: 10px;
+            margin: 10px 0 14px;
+            background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.08));
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-enable-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-button-row {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-actions,
+        #aspect_vocalia_settings .aspect-vocalia-button-row {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-control-with-tip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            flex: 0 0 auto;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-actions button,
+        #aspect_vocalia_settings .aspect-vocalia-button-row button,
+        #aspect_vocalia_settings .aspect-vocalia-critical-button-row button {
+            white-space: nowrap;
+            width: auto;
+            min-width: max-content;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-popup-wrap {
+            position: relative;
+            display: inline-flex;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-popup-button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            white-space: nowrap;
+            width: auto;
+            min-width: max-content;
+            flex: 0 0 auto;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-popup {
+            display: none;
+            position: absolute;
+            left: 0;
+            top: calc(100% + 4px);
+            z-index: 10000;
+            box-sizing: border-box;
+            padding: 10px;
+            border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.25));
+            border-radius: 8px;
+            background: var(--SmartThemeBlurTintColor, var(--SmartThemeBodyColor, #1e1e1e));
+            box-shadow: 0 4px 12px rgba(0,0,0,0.35);
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-popup.aspect-vocalia-popup-open {
+            position: fixed;
+            left: var(--aspect-vocalia-popup-left, 8px);
+            top: var(--aspect-vocalia-popup-top, 8px);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            width: min(680px, calc(100vw - 16px));
+            max-height: calc(100vh - 16px);
+            overflow: auto;
+        }
+
+        #aspect_vocalia_debug_popup.aspect-vocalia-popup-open {
+            width: min(520px, calc(100vw - 16px));
         }
 
         #aspect_vocalia_member_state_table {
@@ -6413,6 +6657,133 @@ function injectStyles() {
             word-break: break-word;
         }
 
+        .aspect-vocalia-debug-status {
+            display: grid;
+            gap: 0.25em;
+            padding: 0.5em;
+            border: 1px solid var(--SmartThemeBorderColor);
+            border-radius: 6px;
+            opacity: 0.95;
+        }
+
+        .aspect-vocalia-debug-status code {
+            white-space: normal;
+            word-break: break-word;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-footer-divider {
+            border-top: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15));
+            margin-top: 10px;
+            padding-top: 8px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-settings-footer {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            opacity: 0.75;
+            font-size: 0.9em;
+        }
+
+        #aspect_vocalia_settings #aspect_vocalia_settings_author {
+            text-align: right;
+            margin-left: auto;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-info-tooltip {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            margin-left: 0.22em;
+            isolation: isolate;
+            transform: translateY(-0.12em);
+            z-index: 1;
+            white-space: nowrap;
+            vertical-align: text-top;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-info-trigger {
+            border: 0;
+            background: transparent;
+            color: #111111;
+            cursor: help;
+            font-family: "Trebuchet MS", Verdana, sans-serif;
+            font-size: 0.52rem;
+            font-weight: 700;
+            line-height: 1;
+            padding: 2px;
+            opacity: 0.96;
+            transform: translateY(-0.04em);
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-info-trigger-text {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 0.58rem;
+            height: 0.58rem;
+            border-radius: 999px;
+            border: 1px solid color-mix(in srgb, #ffffff 78%, var(--SmartThemeBorderColor) 22%);
+            background: color-mix(in srgb, #ffffff 92%, var(--SmartThemeBlurTintColor, rgba(255,255,255,0.03)) 8%);
+            color: #111111;
+            font: inherit;
+            line-height: 1;
+            box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2);
+            padding-top: 0.08em;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-info-trigger:hover,
+        #aspect_vocalia_settings .aspect-vocalia-info-trigger:focus-visible,
+        #aspect_vocalia_settings .aspect-vocalia-info-tooltip.is-open .aspect-vocalia-info-trigger {
+            opacity: 1;
+        }
+
+        .aspect-vocalia-tooltip-layer {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 2147483646;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-info-bubble,
+        .aspect-vocalia-tooltip-layer .aspect-vocalia-info-bubble {
+            --aspect-vocalia-tooltip-left: 12px;
+            --aspect-vocalia-tooltip-top: 12px;
+            position: fixed;
+            top: var(--aspect-vocalia-tooltip-top);
+            left: var(--aspect-vocalia-tooltip-left);
+            width: min(320px, calc(100vw - 24px));
+            max-width: calc(100vw - 24px);
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid var(--SmartThemeBorderColor);
+            background: var(--SmartThemeBlurTintColor, rgba(28, 28, 28, 1));
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.30);
+            color: var(--SmartThemeBodyColor);
+            font-size: 0.78rem;
+            font-weight: 400;
+            line-height: 1.35;
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+            transform: translate3d(0, -4px, 0);
+            transition: opacity 120ms ease, transform 120ms ease;
+            z-index: 2147483647;
+        }
+
+        .aspect-vocalia-tooltip-layer .aspect-vocalia-info-bubble.is-measuring {
+            display: block;
+            visibility: hidden;
+        }
+
+        .aspect-vocalia-tooltip-layer .aspect-vocalia-info-bubble.is-active.is-positioned {
+            opacity: 1;
+            visibility: visible;
+            pointer-events: auto;
+            transform: translate3d(0, 0, 0);
+        }
+
         #chat .mes[data-aspect-vocalia-rendered="true"] .mes_text {
             display: block;
         }
@@ -6439,10 +6810,37 @@ function injectStyles() {
             font-style: normal;
         }
 
-        .aspect-vocalia-segment-actions[data-display-style="${OVERLAY_STYLE_ITALIC}"],
-        .aspect-vocalia-segment-narration[data-display-style="${OVERLAY_STYLE_ITALIC}"],
-        .aspect-vocalia-segment-thoughts[data-display-style="${OVERLAY_STYLE_ITALIC}"] {
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ITALIC}"] {
             font-style: italic;
+        }
+
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_BOLD}"] {
+            font-weight: 700;
+        }
+
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_BOLD_ITALIC}"] {
+            font-weight: 700;
+            font-style: italic;
+        }
+
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_UNDERLINE}"] {
+            text-decoration: underline;
+        }
+
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_STRIKE}"] {
+            text-decoration: line-through;
+        }
+
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_UPPERCASE}"] {
+            text-transform: uppercase;
+        }
+
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_LOWERCASE}"] {
+            text-transform: lowercase;
+        }
+
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ASTERISKS}"] {
+            opacity: 0.88;
         }
 
         .aspect-vocalia-segment-thoughts {
@@ -6474,23 +6872,408 @@ function injectStyles() {
         .aspect-vocalia-formatted > :last-child {
             margin-bottom: 0;
         }
-
-        .aspect-vocalia-debug-status {
-            display: grid;
-            gap: 0.25em;
-            padding: 0.5em;
-            border: 1px solid var(--SmartThemeBorderColor);
-            border-radius: 6px;
-            opacity: 0.95;
-        }
-
-        .aspect-vocalia-debug-status code {
-            white-space: normal;
-            word-break: break-word;
-        }
     `;
 
     document.head.appendChild(styleElement);
+}
+
+function getManifestAuthorName(author) {
+    if (typeof author === 'string') {
+        return author;
+    }
+
+    if (Array.isArray(author)) {
+        return author
+            .map(entry => getManifestAuthorName(entry))
+            .filter(Boolean)
+            .join(', ');
+    }
+
+    if (author && typeof author === 'object') {
+        return String(author.name || author.author || author.display_name || '').trim();
+    }
+
+    return '';
+}
+
+async function loadVocaliaManifestMetadata() {
+    try {
+        const manifestUrl = new URL('./manifest.json', import.meta.url);
+        const response = await fetch(manifestUrl);
+
+        if (!response.ok) {
+            throw new Error(`Manifest request failed: ${response.status}`);
+        }
+
+        const manifest = await response.json();
+        const version = String(manifest.version || VOCALIA_DEFAULT_MANIFEST_META.version).trim();
+        const author = getManifestAuthorName(manifest.author).trim() || VOCALIA_DEFAULT_MANIFEST_META.author;
+
+        vocaliaManifestMeta = { version, author };
+        renderVocaliaSettingsFooter();
+    } catch (error) {
+        console.warn(`[${MODULE_NAME}] Failed to load manifest metadata:`, error);
+
+        vocaliaManifestMeta = { ...VOCALIA_DEFAULT_MANIFEST_META };
+        renderVocaliaSettingsFooter();
+    }
+}
+
+function renderVocaliaSettingsFooter() {
+    $('#aspect_vocalia_settings_version').text(`Version ${vocaliaManifestMeta.version}`);
+    $('#aspect_vocalia_settings_author').text(vocaliaManifestMeta.author);
+}
+
+function renderVocaliaInfoTip(key, label = 'More information') {
+    const helpText = VOCALIA_LABEL_HELP[key];
+    if (!helpText) return '';
+
+    return `<span class="aspect-vocalia-info-tooltip" data-tooltip-key="${escapeHtml(key)}"><button
+                type="button"
+                class="aspect-vocalia-info-trigger"
+                aria-label="${escapeHtml(label)}"
+                aria-expanded="false"
+            ><span class="aspect-vocalia-info-trigger-text" aria-hidden="true">i</span></button><span class="aspect-vocalia-info-bubble" role="tooltip">${escapeHtml(helpText)}</span></span>`;
+}
+
+function appendVocaliaInfoTip(target, key, label) {
+    if (!target || !VOCALIA_LABEL_HELP[key]) return;
+    if (target.querySelector?.(`.aspect-vocalia-info-tooltip[data-tooltip-key="${key}"]`)) return;
+
+    target.insertAdjacentHTML('beforeend', renderVocaliaInfoTip(key, label));
+}
+
+function getVocaliaComparableLabelText(element) {
+    if (!element) return '';
+
+    const cloneElement = element.cloneNode(true);
+    cloneElement.querySelectorAll('.aspect-vocalia-info-tooltip').forEach(node => node.remove());
+
+    return cloneElement.textContent.trim();
+}
+
+function findVocaliaLabelByText(text, selector = '.aspect-vocalia-label-text, .aspect-vocalia-label, .aspect-vocalia-section-title, .aspect-vocalia-popup-title') {
+    const root = document.getElementById('aspect_vocalia_settings');
+    if (!root) return null;
+
+    const normalized = String(text ?? '').trim();
+
+    return Array.from(root.querySelectorAll(selector))
+        .find(element => getVocaliaComparableLabelText(element) === normalized) ?? null;
+}
+
+function addVocaliaInfoTipsToSettings() {
+    const root = document.getElementById('aspect_vocalia_settings');
+    if (!root) return;
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Critical Controls'), 'critical_controls', 'Explain Critical Controls');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Enable Extension'), 'enabled', 'Explain Enable Extension');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_settings .aspect-vocalia-reset-tip-anchor'), 'reset_extension', 'Explain Reset Extension');
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Runtime'), 'runtime', 'Explain Runtime');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Change Group Reply Strategy to Manual Automatically'), 'auto_manual', 'Explain Manual Strategy');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Restore Original Group Reply Strategy Automatically'), 'restore_strategy', 'Explain Strategy Restore');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Use silent /trigger first'), 'use_slash_trigger', 'Explain /trigger');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Fallback to internal force_chid generation if /trigger fails'), 'fallback_generate', 'Explain force_chid fallback');
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Turn Flow'), 'turn_flow', 'Explain Turn Flow');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Apply first-assistant arriving= array'), 'arrival_mode', 'Explain Arrivals');
+    appendVocaliaInfoTip(findVocaliaLabelByText('On First Message, Trigger Character by Name Match'), 'first_name_match', 'Explain First Message Name Match');
+    appendVocaliaInfoTip(findVocaliaLabelByText('If No Character Match on First Message'), 'first_fallback', 'Explain First Message Fallback');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Max Participants Per Turn'), 'max_participants', 'Explain Max Participants');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Max Responses Per Turn'), 'max_responses', 'Explain Max Responses');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Delay Between Responses'), 'response_delay', 'Explain Response Delay');
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Refined Message Display'), 'refined_display', 'Explain Refined Message Display');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Display Raw Message as Refined Message'), 'render_overlay', 'Explain Refined Message');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Hide Character Name in Refined Message'), 'hide_character_name', 'Explain Character Name Display');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Hide Thoughts in Refined Message'), 'hide_thoughts', 'Explain Thought Display');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Wrap Dialogue in Quotes in Refined Message'), 'quote_dialogue', 'Explain Dialogue Quotes');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Style for Actions'), 'action_style', 'Explain Action Style');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Style for Narration'), 'narration_style', 'Explain Narration Style');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Style for Thoughts'), 'thoughts_style', 'Explain Thought Style');
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Protocol'), 'protocol', 'Explain Protocol');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Protocol injection depth'), 'prompt_depth', 'Explain Protocol Depth');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Hide Debug Toasts'), 'hide_debug_toasts', 'Explain Debug Toasts');
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Status', '.aspect-vocalia-section-title'), 'status_section', 'Explain Status');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Status', '#aspect_vocalia_status_popup .aspect-vocalia-popup-title'), 'status_popup', 'Explain Status Popup');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_status_popup .aspect-vocalia-status-arrays-label'), 'status_arrays', 'Explain Scene Arrays');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_status_popup .aspect-vocalia-status-members-label'), 'status_member_table', 'Explain Member Status Table');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_status_popup .aspect-vocalia-sync-tip-anchor'), 'sync_state', 'Explain Sync Scene State');
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Debug Log', '#aspect_vocalia_debug_popup .aspect-vocalia-popup-title'), 'debug_popup', 'Explain Debug Log');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_debug_popup .aspect-vocalia-debug-status-label'), 'debug_status', 'Explain Debug Status');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_debug_popup .aspect-vocalia-debug-controls-label'), 'debug_log_controls', 'Explain Debug Log Controls');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_debug_popup .aspect-vocalia-dump-state-tip-anchor'), 'dump_state', 'Explain Log State');
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Utilities'), 'utilities', 'Explain Utilities');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_settings .aspect-vocalia-render-now-tip-anchor'), 'render_now', 'Explain Apply Render Setting');
+}
+
+function setupVocaliaInfoTooltips() {
+    const root = document.getElementById('aspect_vocalia_settings');
+    if (!root || root.dataset.infoTooltipsBound === 'true') return;
+
+    const viewportPadding = 12;
+    const tooltipLayerId = 'aspect_vocalia_tooltip_layer';
+
+    let tooltipLayer = document.getElementById(tooltipLayerId);
+    if (!tooltipLayer) {
+        tooltipLayer = document.createElement('div');
+        tooltipLayer.id = tooltipLayerId;
+        tooltipLayer.className = 'aspect-vocalia-tooltip-layer';
+        document.body.appendChild(tooltipLayer);
+    }
+
+    root.querySelectorAll('.aspect-vocalia-info-tooltip').forEach((tooltip, index) => {
+        const bubble = tooltip.querySelector('.aspect-vocalia-info-bubble');
+        if (!bubble) return;
+
+        const bubbleId = bubble.id || `aspect_vocalia_tooltip_${index + 1}`;
+        bubble.id = bubbleId;
+        tooltip.dataset.tooltipBubbleId = bubbleId;
+
+        if (bubble.parentElement !== tooltipLayer) {
+            tooltipLayer.appendChild(bubble);
+        }
+    });
+
+    const getTooltipParts = tooltip => {
+        if (!tooltip) return { trigger: null, bubble: null };
+
+        const trigger = tooltip.querySelector('.aspect-vocalia-info-trigger');
+        const bubbleId = tooltip.dataset.tooltipBubbleId || '';
+        const bubble = bubbleId ? document.getElementById(bubbleId) : null;
+
+        return { trigger, bubble };
+    };
+
+    const clearTooltipPosition = bubble => {
+        if (!bubble) return;
+
+        bubble.classList.remove('is-active', 'is-measuring', 'is-positioned');
+        bubble.style.removeProperty('--aspect-vocalia-tooltip-left');
+        bubble.style.removeProperty('--aspect-vocalia-tooltip-top');
+    };
+
+    const updateTooltipPosition = tooltip => {
+        if (!tooltip) return;
+
+        const { trigger, bubble } = getTooltipParts(tooltip);
+        if (!trigger || !bubble) return;
+
+        bubble.classList.remove('is-positioned');
+        bubble.classList.add('is-measuring');
+        bubble.style.removeProperty('--aspect-vocalia-tooltip-left');
+        bubble.style.removeProperty('--aspect-vocalia-tooltip-top');
+
+        const triggerRect = trigger.getBoundingClientRect();
+        const bubbleRect = bubble.getBoundingClientRect();
+        const maxLeft = Math.max(viewportPadding, window.innerWidth - viewportPadding - bubbleRect.width);
+        const desiredLeft = triggerRect.right - bubbleRect.width;
+        const left = Math.min(Math.max(viewportPadding, desiredLeft), maxLeft);
+        const top = Math.min(
+            triggerRect.bottom + 8,
+            Math.max(viewportPadding, window.innerHeight - viewportPadding - bubbleRect.height),
+        );
+
+        bubble.style.setProperty('--aspect-vocalia-tooltip-left', `${Math.round(left)}px`);
+        bubble.style.setProperty('--aspect-vocalia-tooltip-top', `${Math.round(top)}px`);
+        bubble.classList.remove('is-measuring');
+        bubble.classList.add('is-positioned');
+    };
+
+    const hideTooltip = tooltip => {
+        if (!tooltip) return;
+
+        tooltip.classList.remove('is-open');
+        tooltip.dataset.justClosed = 'true';
+
+        setTimeout(() => {
+            if (tooltip.dataset.justClosed === 'true') {
+                delete tooltip.dataset.justClosed;
+            }
+        }, 0);
+
+        const { trigger, bubble } = getTooltipParts(tooltip);
+        if (trigger) {
+            trigger.setAttribute('aria-expanded', 'false');
+        }
+
+        clearTooltipPosition(bubble);
+    };
+
+    const showTooltip = (tooltip, { pinned = false } = {}) => {
+        if (!tooltip || tooltip.dataset.justClosed === 'true') return;
+
+        const { trigger, bubble } = getTooltipParts(tooltip);
+        if (!trigger || !bubble) return;
+
+        bubble.classList.add('is-active');
+        tooltip.classList.toggle('is-open', pinned);
+        trigger.setAttribute('aria-expanded', pinned ? 'true' : 'false');
+        updateTooltipPosition(tooltip);
+    };
+
+    const closeOpenTooltips = (except = null) => {
+        root.querySelectorAll('.aspect-vocalia-info-tooltip').forEach(tooltip => {
+            if (tooltip === except) return;
+            hideTooltip(tooltip);
+        });
+    };
+
+    root.addEventListener('pointerdown', event => {
+        const trigger = event.target.closest('.aspect-vocalia-info-trigger');
+        if (!trigger) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+    }, true);
+
+    root.addEventListener('mouseenter', event => {
+        const tooltip = event.target.closest('.aspect-vocalia-info-tooltip');
+        if (!tooltip || tooltip.classList.contains('is-open')) return;
+
+        closeOpenTooltips(tooltip);
+        showTooltip(tooltip);
+    }, true);
+
+    root.addEventListener('mouseleave', event => {
+        const tooltip = event.target.closest('.aspect-vocalia-info-tooltip');
+        if (!tooltip || tooltip.classList.contains('is-open')) return;
+
+        hideTooltip(tooltip);
+    }, true);
+
+    root.addEventListener('focusin', event => {
+        const tooltip = event.target.closest('.aspect-vocalia-info-tooltip');
+        if (!tooltip || tooltip.classList.contains('is-open')) return;
+
+        closeOpenTooltips(tooltip);
+        showTooltip(tooltip);
+    });
+
+    root.addEventListener('focusout', event => {
+        const tooltip = event.target.closest('.aspect-vocalia-info-tooltip');
+        if (!tooltip || tooltip.classList.contains('is-open')) return;
+
+        const nextTarget = event.relatedTarget;
+        if (nextTarget && tooltip.contains(nextTarget)) return;
+
+        hideTooltip(tooltip);
+    });
+
+    root.addEventListener('click', event => {
+        const trigger = event.target.closest('.aspect-vocalia-info-trigger');
+        if (!trigger) return;
+
+        const tooltip = trigger.closest('.aspect-vocalia-info-tooltip');
+        if (!tooltip) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        trigger.focus({ preventScroll: true });
+
+        const willOpen = !tooltip.classList.contains('is-open');
+        closeOpenTooltips(tooltip);
+
+        if (!willOpen) {
+            hideTooltip(tooltip);
+            return;
+        }
+
+        showTooltip(tooltip, { pinned: true });
+    });
+
+    root.addEventListener('keydown', event => {
+        if (event.key !== 'Escape') return;
+        closeOpenTooltips();
+    });
+
+    document.addEventListener('pointerdown', event => {
+        if (event.target.closest('#aspect_vocalia_settings .aspect-vocalia-info-tooltip')) return;
+        closeOpenTooltips();
+    }, true);
+
+    window.addEventListener('resize', () => {
+        root.querySelectorAll('.aspect-vocalia-info-tooltip.is-open').forEach(updateTooltipPosition);
+    });
+
+    window.addEventListener('scroll', () => closeOpenTooltips(), true);
+
+    root.dataset.infoTooltipsBound = 'true';
+}
+
+function clampVocaliaNumber(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
+
+function closeVocaliaPopups() {
+    $('.aspect-vocalia-popup')
+        .removeClass('aspect-vocalia-popup-open')
+        .css({
+            '--aspect-vocalia-popup-left': '',
+            '--aspect-vocalia-popup-top': '',
+        });
+}
+
+function positionVocaliaPopupInViewport($popup, button) {
+    const popupElement = $popup?.[0];
+
+    if (!popupElement || !button) return;
+
+    const margin = 8;
+    const buttonRect = button.getBoundingClientRect();
+
+    $popup.css({
+        '--aspect-vocalia-popup-left': `${margin}px`,
+        '--aspect-vocalia-popup-top': `${margin}px`,
+    });
+
+    requestAnimationFrame(() => {
+        if (!$popup.hasClass('aspect-vocalia-popup-open')) return;
+
+        const popupWidth = Math.min(popupElement.offsetWidth || 260, window.innerWidth - (margin * 2));
+        const popupHeight = Math.min(popupElement.offsetHeight || 0, window.innerHeight - (margin * 2));
+
+        const maxLeft = Math.max(margin, window.innerWidth - popupWidth - margin);
+        const maxTop = Math.max(margin, window.innerHeight - popupHeight - margin);
+
+        const left = clampVocaliaNumber(buttonRect.left, margin, maxLeft);
+        let top = buttonRect.bottom + 4;
+
+        if (top > maxTop && buttonRect.top - popupHeight - 4 >= margin) {
+            top = buttonRect.top - popupHeight - 4;
+        }
+
+        top = clampVocaliaNumber(top, margin, maxTop);
+
+        $popup.css({
+            '--aspect-vocalia-popup-left': `${left}px`,
+            '--aspect-vocalia-popup-top': `${top}px`,
+        });
+    });
+}
+
+function toggleVocaliaPopup(button, popupSelector) {
+    const $popup = $(popupSelector);
+    const wasOpen = $popup.hasClass('aspect-vocalia-popup-open');
+
+    closeVocaliaPopups();
+
+    if (!wasOpen) {
+        $popup.addClass('aspect-vocalia-popup-open');
+        positionVocaliaPopupInViewport($popup, button);
+    }
+}
+
+function stopVocaliaPopupEvent(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
 }
 
 function getNamesForAvatars(avatars) {
@@ -6600,14 +7383,22 @@ function renderStatusOptions(selectedStatus) {
 }
 
 function renderOverlayStyleOptions(selectedStyle) {
+    const normalizedSelectedStyle = normalizeOverlayStyle(selectedStyle);
+
     const options = [
-        [OVERLAY_STYLE_PLAIN, 'Plain text'],
-        [OVERLAY_STYLE_ITALIC, 'CSS italic'],
-        [OVERLAY_STYLE_ASTERISKS, 'SillyTavern asterisk styling'],
+        [OVERLAY_STYLE_PLAIN, 'None'],
+        [OVERLAY_STYLE_BOLD, 'Bold'],
+        [OVERLAY_STYLE_ITALIC, 'Italics'],
+        [OVERLAY_STYLE_BOLD_ITALIC, 'Bold Italics'],
+        [OVERLAY_STYLE_ASTERISKS, 'Muted Italics'],
+        [OVERLAY_STYLE_UNDERLINE, 'Underline'],
+        [OVERLAY_STYLE_STRIKE, 'Strike-through'],
+        [OVERLAY_STYLE_UPPERCASE, 'Uppercase'],
+        [OVERLAY_STYLE_LOWERCASE, 'Lowercase'],
     ];
 
     return options.map(([value, label]) => {
-        const selected = value === selectedStyle ? ' selected' : '';
+        const selected = value === normalizedSelectedStyle ? ' selected' : '';
         return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(label)}</option>`;
     }).join('');
 }
@@ -6683,6 +7474,99 @@ function updateDebugLogUi() {
     $('#aspect_vocalia_debug_stopped').text(vocaliaDebugStoppedAt ?? 'not stopped');
 }
 
+function getRefinedMessageCharacterNameHidden(settings = getSettings()) {
+    if (Object.hasOwn(settings, 'hideCharacterNameInRefinedMessage')) {
+        return !!settings.hideCharacterNameInRefinedMessage;
+    }
+
+    return !Boolean(settings.showCharacterLabels);
+}
+
+function getRefinedMessageThoughtsHidden(settings = getSettings()) {
+    if (Object.hasOwn(settings, 'hideThoughtsInRefinedMessage')) {
+        return !!settings.hideThoughtsInRefinedMessage;
+    }
+
+    return !Boolean(settings.showThoughts);
+}
+
+function getDebugToastsHidden(settings = getSettings()) {
+    if (Object.hasOwn(settings, 'hideDebugToasts')) {
+        return !!settings.hideDebugToasts;
+    }
+
+    return !Boolean(settings.showDebugToasts);
+}
+
+function setInvertedBooleanSetting(newKey, legacyKey, hidden) {
+    const settings = getSettings();
+    settings[newKey] = !!hidden;
+
+    try {
+        settings[legacyKey] = !Boolean(hidden);
+    } catch {
+        // Compatibility alias may be read-only in a future implementation.
+    }
+
+    saveSettings();
+}
+
+function formatDelaySeconds(milliseconds) {
+    const seconds = Math.max(0, Number(milliseconds || 0) / 1000);
+    return Number(seconds.toFixed(3)).toString();
+}
+
+function clampDelaySeconds(value) {
+    return Math.min(10, Math.max(0, Number(value) || 0));
+}
+
+async function resetVocaliaExtension() {
+    const confirmed = window.confirm(
+        'Reset Aspect: Vocalia?\n\n' +
+        'This will restore extension settings to defaults, clear Vocalia state for the current chat, stop any active queue/debug logging, and resync the current group state.',
+    );
+
+    if (!confirmed) return;
+
+    const context = ctx();
+
+    triggerQueue = [];
+    queueRunning = false;
+    vocaliaEmptySendInProgress = false;
+    vocaliaControlledGenerationInProgress = false;
+
+    for (const waiter of vocaliaPendingTriggerWaiters) {
+        if (waiter.timer) clearTimeout(waiter.timer);
+    }
+
+    vocaliaPendingTriggerWaiters = [];
+    vocaliaRecentTriggerAttempts = [];
+
+    clearActiveGenerationTarget?.('reset_extension');
+    clearVocaliaDebugLog();
+
+    context.extensionSettings[MODULE_NAME] = clone(DEFAULT_SETTINGS);
+    context.chatMetadata[MODULE_NAME] = clone(DEFAULT_CHAT_STATE);
+
+    ensureStateForCurrentGroup();
+    updateExtensionPrompt();
+    applyOverlaySettingToVisibleMessages();
+    updateDiagnosticsPanel();
+
+    saveSettings();
+    await saveMetadata();
+
+    loadSettingsUi();
+
+    if (getSettings().enabled) {
+        await enableRuntime();
+    } else {
+        await disableRuntime();
+    }
+
+    globalThis.toastr?.success('Aspect: Vocalia has been reset.', MODULE_DISPLAY_NAME);
+}
+
 function injectSettingsUi() {
     if ($('#aspect_vocalia_settings').length) return;
 
@@ -6695,169 +7579,255 @@ function injectSettingsUi() {
             </div>
 
             <div class="inline-drawer-content">
-                <div class="flex-container flexFlowColumn">
-                    <label class="checkbox_label">
-                        <input id="av_enabled" type="checkbox">
-                        <span>Enable Extension</span>
-                    </label>
+                <div class="aspect-vocalia-settings-box">
+                    <div class="aspect-vocalia-settings-tagline">The Aspect of Voice</div>
 
-                    <label class="checkbox_label">
-                        <input id="av_auto_manual" type="checkbox">
-                        <span>Change Group Reply Strategy to Manual Automatically</span>
-                    </label>
+                    <div class="aspect-vocalia-critical-box">
+                        <div class="aspect-vocalia-section-title">Critical Controls</div>
 
-                    <label class="checkbox_label">
-                        <input id="av_restore_strategy" type="checkbox">
-                        <span>Restore Original Group Reply Strategy Automatically</span>
-                    </label>
+                        <div class="aspect-vocalia-critical-enable-row">
+                            <label class="checkbox_label">
+                                <input id="av_enabled" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Enable Extension</span>
+                            </label>
+                        </div>
 
-                    <label class="checkbox_label">
-                        <input id="av_use_slash" type="checkbox">
-                        <span>Use silent /trigger first</span>
-                    </label>
+                        <div class="aspect-vocalia-critical-button-row">
+                            <span class="aspect-vocalia-control-with-tip aspect-vocalia-reset-tip-anchor">
+                                <button
+                                    id="av_reset_extension"
+                                    type="button"
+                                    class="menu_button danger_button"
+                                    title="Reset Aspect: Vocalia settings and current chat state."
+                                >
+                                    Reset Extension
+                                </button>
+                            </span>
 
-                    <label class="checkbox_label">
-                        <input id="av_fallback_generate" type="checkbox">
-                        <span>Fallback to internal force_chid generation if /trigger fails</span>
-                    </label>
+                            <span class="aspect-vocalia-popup-wrap">
+                                <button
+                                    id="av_debug_popup_button"
+                                    type="button"
+                                    class="menu_button aspect-vocalia-popup-button"
+                                >
+                                    Debug Log
+                                </button>
 
-                    <hr>
+                                <div id="aspect_vocalia_debug_popup" class="aspect-vocalia-popup">
+                                    <div class="aspect-vocalia-popup-title">Debug Log</div>
 
-                    <label for="av_arrival_mode">Apply first-assistant arriving= array</label>
-                    <select id="av_arrival_mode" class="text_pole">
-                        <option value="${ARRIVAL_APPLY_IMMEDIATE}">Immediately when the first assistant declares it</option>
-                        <option value="${ARRIVAL_APPLY_DEFERRED}">After the current auto-reply chain ends</option>
-                    </select>
+                                    <div class="aspect-vocalia-label aspect-vocalia-debug-status-label">Debug status</div>
+                                    <div class="aspect-vocalia-debug-status">
+                                        <div>Active: <code id="aspect_vocalia_debug_active">no</code></div>
+                                        <div>Entries: <code id="aspect_vocalia_debug_entries">0</code></div>
+                                        <div>Started: <code id="aspect_vocalia_debug_started">not started</code></div>
+                                        <div>Stopped: <code id="aspect_vocalia_debug_stopped">not stopped</code></div>
+                                    </div>
 
-                    <label class="checkbox_label">
-                        <input id="av_first_name_match" type="checkbox">
-                        <span>On First Message, Trigger Character by Name Match</span>
-                    </label>
+                                    <div class="aspect-vocalia-label aspect-vocalia-debug-controls-label">Debug controls</div>
+                                    <div class="aspect-vocalia-button-row">
+                                        <input id="av_debug_start" class="menu_button" type="button" value="Start logging">
+                                        <input id="av_debug_stop" class="menu_button" type="button" value="Stop logging">
+                                        <input id="av_debug_copy" class="menu_button" type="button" value="Copy log">
+                                        <input id="av_debug_download" class="menu_button" type="button" value="Download log">
+                                        <input id="av_debug_clear" class="menu_button" type="button" value="Clear log">
+                                    </div>
 
-                    <label for="av_first_fallback">If No Character Match on First Message</label>
-                    <select id="av_first_fallback" class="text_pole">
-                        <option value="${FIRST_MESSAGE_FALLBACK_RANDOM_PRESENT}">Trigger a random eligible group member</option>
-                        <option value="${FIRST_MESSAGE_FALLBACK_FIRST_PRESENT}">Trigger first eligible group member</option>
-                        <option value="${FIRST_MESSAGE_FALLBACK_DO_NOTHING}">Do nothing</option>
-                    </select>
-
-                    <div class="flex-container alignItemsCenter">
-                        <label for="av_max_triggers" class="flexGrow">Max Participants Per Turn</label>
-                        <input id="av_max_triggers" class="text_pole widthUnset" type="number" min="1" max="10" step="1">
+                                    <div class="aspect-vocalia-button-row">
+                                        <span class="aspect-vocalia-control-with-tip aspect-vocalia-dump-state-tip-anchor">
+                                            <input id="av_dump_state" class="menu_button" type="button" value="Log state">
+                                        </span>
+                                    </div>
+                                </div>
+                            </span>
+                        </div>
                     </div>
 
-                    <div class="flex-container alignItemsCenter">
-                        <label for="av_max_chain" class="flexGrow">Max Responses Per Turn</label>
-                        <input id="av_max_chain" class="text_pole widthUnset" type="number" min="0" max="50" step="1">
+                    <div class="aspect-vocalia-settings-section">
+                        <div class="aspect-vocalia-section-title">Runtime</div>
+
+                        <div class="flex-container flexFlowColumn">
+                            <label class="checkbox_label">
+                                <input id="av_auto_manual" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Change Group Reply Strategy to Manual Automatically</span>
+                            </label>
+
+                            <label class="checkbox_label">
+                                <input id="av_restore_strategy" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Restore Original Group Reply Strategy Automatically</span>
+                            </label>
+
+                            <label class="checkbox_label">
+                                <input id="av_use_slash" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Use silent /trigger first</span>
+                            </label>
+
+                            <label class="checkbox_label">
+                                <input id="av_fallback_generate" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Fallback to internal force_chid generation if /trigger fails</span>
+                            </label>
+                        </div>
                     </div>
 
-                    <div class="flex-container alignItemsCenter">
-                        <label for="av_trigger_delay" class="flexGrow">Delay Between Responses</label>
-                        <input id="av_trigger_delay" class="text_pole widthUnset" type="number" min="0" max="10" step="0.05">
+                    <div class="aspect-vocalia-settings-section">
+                        <div class="aspect-vocalia-section-title">Turn Flow</div>
+
+                        <div class="flex-container flexFlowColumn">
+                            <label for="av_arrival_mode" class="aspect-vocalia-label">Apply first-assistant arriving= array</label>
+                            <select id="av_arrival_mode" class="text_pole">
+                                <option value="${ARRIVAL_APPLY_IMMEDIATE}">Immediately when the first assistant declares it</option>
+                                <option value="${ARRIVAL_APPLY_DEFERRED}">After the current auto-reply chain ends</option>
+                            </select>
+
+                            <label class="checkbox_label">
+                                <input id="av_first_name_match" type="checkbox">
+                                <span class="aspect-vocalia-label-text">On First Message, Trigger Character by Name Match</span>
+                            </label>
+
+                            <label for="av_first_fallback" class="aspect-vocalia-label">If No Character Match on First Message</label>
+                            <select id="av_first_fallback" class="text_pole">
+                                <option value="${FIRST_MESSAGE_FALLBACK_RANDOM_PRESENT}">Trigger a random eligible group member</option>
+                                <option value="${FIRST_MESSAGE_FALLBACK_FIRST_PRESENT}">Trigger first eligible group member</option>
+                                <option value="${FIRST_MESSAGE_FALLBACK_DO_NOTHING}">Do nothing</option>
+                            </select>
+
+                            <div class="flex-container alignItemsCenter">
+                                <label for="av_max_triggers" class="flexGrow aspect-vocalia-label">Max Participants Per Turn</label>
+                                <input id="av_max_triggers" class="text_pole widthUnset" type="number" min="1" max="10" step="1">
+                            </div>
+
+                            <div class="flex-container alignItemsCenter">
+                                <label for="av_max_chain" class="flexGrow aspect-vocalia-label">Max Responses Per Turn</label>
+                                <input id="av_max_chain" class="text_pole widthUnset" type="number" min="0" max="50" step="1">
+                            </div>
+
+                            <div class="flex-container alignItemsCenter">
+                                <label for="av_trigger_delay" class="flexGrow aspect-vocalia-label">Delay Between Responses</label>
+                                <input id="av_trigger_delay" class="text_pole widthUnset" type="number" min="0" max="10" step="0.05">
+                            </div>
+                        </div>
                     </div>
 
-                    <hr>
+                    <div class="aspect-vocalia-settings-section">
+                        <div class="aspect-vocalia-section-title">Refined Message Display</div>
 
-                    <label class="checkbox_label">
-                        <input id="av_render_overlay" type="checkbox">
-                        <span>Display Raw Message as Refined Message</span>
-                    </label>
+                        <div class="flex-container flexFlowColumn">
+                            <label class="checkbox_label">
+                                <input id="av_render_overlay" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Display Raw Message as Refined Message</span>
+                            </label>
 
-                    <label class="checkbox_label">
-                        <input id="av_hide_character_name" type="checkbox">
-                        <span>Hide Character Name in Refined Message</span>
-                    </label>
+                            <label class="checkbox_label">
+                                <input id="av_hide_character_name" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Hide Character Name in Refined Message</span>
+                            </label>
 
-                    <label class="checkbox_label">
-                        <input id="av_hide_thoughts" type="checkbox">
-                        <span>Hide Thoughts in Refined Message</span>
-                    </label>
+                            <label class="checkbox_label">
+                                <input id="av_hide_thoughts" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Hide Thoughts in Refined Message</span>
+                            </label>
 
-                    <label class="checkbox_label">
-                        <input id="av_quote_dialogue" type="checkbox">
-                        <span>Wrap Dialogue in Quotes in Refined Message</span>
-                    </label>
+                            <label class="checkbox_label">
+                                <input id="av_quote_dialogue" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Wrap Dialogue in Quotes in Refined Message</span>
+                            </label>
 
-                    <label for="av_action_style">Style for Actions</label>
-                    <select id="av_action_style" class="text_pole">
-                        ${renderOverlayStyleOptions(getSettings().actionDisplayStyle)}
-                    </select>
+                            <label for="av_action_style" class="aspect-vocalia-label">Style for Actions</label>
+                            <select id="av_action_style" class="text_pole">
+                                ${renderOverlayStyleOptions(getSettings().actionDisplayStyle)}
+                            </select>
 
-                    <label for="av_narration_style">Style for Narration</label>
-                    <select id="av_narration_style" class="text_pole">
-                        ${renderOverlayStyleOptions(getSettings().narrationDisplayStyle)}
-                    </select>
+                            <label for="av_narration_style" class="aspect-vocalia-label">Style for Narration</label>
+                            <select id="av_narration_style" class="text_pole">
+                                ${renderOverlayStyleOptions(getSettings().narrationDisplayStyle)}
+                            </select>
 
-                    <label for="av_thoughts_style">Style for Thoughts</label>
-                    <select id="av_thoughts_style" class="text_pole">
-                        ${renderOverlayStyleOptions(getSettings().thoughtsDisplayStyle)}
-                    </select>
-
-                    <hr>
-
-                    <div class="flex-container alignItemsCenter">
-                        <label for="av_prompt_depth" class="flexGrow">Protocol injection depth</label>
-                        <input id="av_prompt_depth" class="text_pole widthUnset" type="number" min="0" max="100" step="1">
+                            <label for="av_thoughts_style" class="aspect-vocalia-label">Style for Thoughts</label>
+                            <select id="av_thoughts_style" class="text_pole">
+                                ${renderOverlayStyleOptions(getSettings().thoughtsDisplayStyle)}
+                            </select>
+                        </div>
                     </div>
 
-                    <label class="checkbox_label">
-                        <input id="av_hide_debug_toasts" type="checkbox">
-                        <span>Hide Debug Toasts</span>
-                    </label>
+                    <div class="aspect-vocalia-settings-section">
+                        <div class="aspect-vocalia-section-title">Protocol</div>
 
-                    <hr>
+                        <div class="flex-container flexFlowColumn">
+                            <div class="flex-container alignItemsCenter">
+                                <label for="av_prompt_depth" class="flexGrow aspect-vocalia-label">Protocol injection depth</label>
+                                <input id="av_prompt_depth" class="text_pole widthUnset" type="number" min="0" max="100" step="1">
+                            </div>
 
-                    <b>Scene Diagnostics</b>
-
-                    <div class="aspect-vocalia-array-list">
-                        <div>Present: <code id="aspect_vocalia_array_present">none</code></div>
-                        <div>Remote: <code id="aspect_vocalia_array_remote">none</code></div>
-                        <div>Idle: <code id="aspect_vocalia_array_idle">none</code></div>
-                        <div>Arriving: <code id="aspect_vocalia_array_arriving">none</code></div>
-                        <div>Departing: <code id="aspect_vocalia_array_departing">none</code></div>
-                        <div>Absent: <code id="aspect_vocalia_array_absent">none</code></div>
-                        <div>Triggered this user turn: <code id="aspect_vocalia_array_triggered">none</code></div>
+                            <label class="checkbox_label">
+                                <input id="av_hide_debug_toasts" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Hide Debug Toasts</span>
+                            </label>
+                        </div>
                     </div>
 
-                    <table id="aspect_vocalia_member_state_table">
-                        <thead>
-                            <tr>
-                                <th>Group member</th>
-                                <th>Allowance</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody></tbody>
-                    </table>
+                    <div class="aspect-vocalia-settings-section">
+                        <div class="aspect-vocalia-section-title">Status</div>
 
-                    <hr>
+                        <span class="aspect-vocalia-popup-wrap">
+                            <button
+                                id="av_status_popup_button"
+                                type="button"
+                                class="menu_button aspect-vocalia-popup-button"
+                            >
+                                Status
+                            </button>
 
-                    <b>Debug Log</b>
+                            <div id="aspect_vocalia_status_popup" class="aspect-vocalia-popup">
+                                <div class="aspect-vocalia-popup-title">Status</div>
 
-                    <div class="aspect-vocalia-debug-status">
-                        <div>Active: <code id="aspect_vocalia_debug_active">no</code></div>
-                        <div>Entries: <code id="aspect_vocalia_debug_entries">0</code></div>
-                        <div>Started: <code id="aspect_vocalia_debug_started">not started</code></div>
-                        <div>Stopped: <code id="aspect_vocalia_debug_stopped">not stopped</code></div>
+                                <div class="aspect-vocalia-label aspect-vocalia-status-arrays-label">Scene arrays</div>
+                                <div class="aspect-vocalia-array-list">
+                                    <div>Present: <code id="aspect_vocalia_array_present">none</code></div>
+                                    <div>Remote: <code id="aspect_vocalia_array_remote">none</code></div>
+                                    <div>Idle: <code id="aspect_vocalia_array_idle">none</code></div>
+                                    <div>Arriving: <code id="aspect_vocalia_array_arriving">none</code></div>
+                                    <div>Departing: <code id="aspect_vocalia_array_departing">none</code></div>
+                                    <div>Absent: <code id="aspect_vocalia_array_absent">none</code></div>
+                                    <div>Triggered this user turn: <code id="aspect_vocalia_array_triggered">none</code></div>
+                                </div>
+
+                                <div class="aspect-vocalia-label aspect-vocalia-status-members-label">Member status table</div>
+                                <table id="aspect_vocalia_member_state_table">
+                                    <thead>
+                                        <tr>
+                                            <th>Group member</th>
+                                            <th>Allowance</th>
+                                            <th>Status</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody></tbody>
+                                </table>
+
+                                <div class="aspect-vocalia-button-row">
+                                    <span class="aspect-vocalia-control-with-tip aspect-vocalia-sync-tip-anchor">
+                                        <input id="av_sync_state" class="menu_button" type="button" value="Sync scene state from group">
+                                    </span>
+                                </div>
+                            </div>
+                        </span>
                     </div>
 
-                    <div class="flex-container">
-                        <input id="av_debug_start" class="menu_button" type="button" value="Start logging">
-                        <input id="av_debug_stop" class="menu_button" type="button" value="Stop logging">
-                        <input id="av_debug_copy" class="menu_button" type="button" value="Copy log">
-                        <input id="av_debug_download" class="menu_button" type="button" value="Download log">
-                        <input id="av_debug_clear" class="menu_button" type="button" value="Clear log">
+                    <div class="aspect-vocalia-settings-section">
+                        <div class="aspect-vocalia-section-title">Utilities</div>
+
+                        <div class="aspect-vocalia-button-row">
+                            <span class="aspect-vocalia-control-with-tip aspect-vocalia-render-now-tip-anchor">
+                                <input id="av_render_now" class="menu_button" type="button" value="Apply render setting now">
+                            </span>
+                        </div>
                     </div>
 
-                    <div class="flex-container">
-                        <input id="av_sync_state" class="menu_button" type="button" value="Sync scene state from group">
-                        <input id="av_render_now" class="menu_button" type="button" value="Apply render setting now">
-                        <input id="av_dump_state" class="menu_button" type="button" value="Log state">
+                    <div class="aspect-vocalia-footer-divider">
+                        <div class="aspect-vocalia-settings-footer">
+                            <span id="aspect_vocalia_settings_version">Version ${escapeHtml(vocaliaManifestMeta.version)}</span>
+                            <span id="aspect_vocalia_settings_author">${escapeHtml(vocaliaManifestMeta.author)}</span>
+                        </div>
                     </div>
-
-                    <small>
-                        Present means physically in-scene. Remote means active phone/radio/video/text contact and eligible to respond. Absent means neither present nor remotely connected.
-                    </small>
                 </div>
             </div>
         </div>
@@ -6865,16 +7835,14 @@ function injectSettingsUi() {
 
     const settingsPanel = $('#extensions_settings2').length ? $('#extensions_settings2') : $('#extensions_settings');
     settingsPanel.append(html);
+
+    renderVocaliaSettingsFooter();
+    void loadVocaliaManifestMetadata();
+
+    addVocaliaInfoTipsToSettings();
+    setupVocaliaInfoTooltips();
+
     bindSettingsUi();
-}
-
-function formatDelaySeconds(milliseconds) {
-    const seconds = Math.max(0, Number(milliseconds || 0) / 1000);
-    return Number(seconds.toFixed(3)).toString();
-}
-
-function clampDelaySeconds(value) {
-    return Math.min(10, Math.max(0, Number(value) || 0));
 }
 
 function loadSettingsUi() {
@@ -6895,19 +7863,20 @@ function loadSettingsUi() {
     $('#av_trigger_delay').val(formatDelaySeconds(settings.triggerDelayMs));
 
     $('#av_render_overlay').prop('checked', !!settings.renderOverlay);
-    $('#av_hide_character_name').prop('checked', !!settings.hideCharacterNameInRefinedMessage);
-    $('#av_hide_thoughts').prop('checked', !!settings.hideThoughtsInRefinedMessage);
+    $('#av_hide_character_name').prop('checked', getRefinedMessageCharacterNameHidden(settings));
+    $('#av_hide_thoughts').prop('checked', getRefinedMessageThoughtsHidden(settings));
     $('#av_quote_dialogue').prop('checked', !!settings.quoteDialogue);
 
-    $('#av_action_style').val(settings.actionDisplayStyle);
-    $('#av_narration_style').val(settings.narrationDisplayStyle);
-    $('#av_thoughts_style').val(settings.thoughtsDisplayStyle);
+    $('#av_action_style').val(normalizeOverlayStyle(settings.actionDisplayStyle));
+    $('#av_narration_style').val(normalizeOverlayStyle(settings.narrationDisplayStyle));
+    $('#av_thoughts_style').val(normalizeOverlayStyle(settings.thoughtsDisplayStyle));
 
     $('#av_prompt_depth').val(String(settings.promptDepth));
-    $('#av_hide_debug_toasts').prop('checked', !!settings.hideDebugToasts);
+    $('#av_hide_debug_toasts').prop('checked', getDebugToastsHidden(settings));
 
     updateDiagnosticsPanel();
     updateDebugLogUi();
+    renderVocaliaSettingsFooter();
 }
 
 function bindSettingsUi() {
@@ -6944,6 +7913,14 @@ function bindSettingsUi() {
 
     const bindSelect = (selector, key, after = null) => {
         $(selector).on('change', async function () {
+            getSettings()[key] = normalizeOverlayStyle(String($(this).val()));
+            saveSettings();
+            if (typeof after === 'function') await after();
+        });
+    };
+
+    const bindPlainSelect = (selector, key, after = null) => {
+        $(selector).on('change', async function () {
             getSettings()[key] = String($(this).val());
             saveSettings();
             if (typeof after === 'function') await after();
@@ -6960,7 +7937,7 @@ function bindSettingsUi() {
     bindCheckbox('#av_use_slash', 'useSlashTrigger');
     bindCheckbox('#av_fallback_generate', 'fallbackToInternalGenerate');
 
-    bindSelect('#av_arrival_mode', 'arrivalApplyMode', async () => {
+    bindPlainSelect('#av_arrival_mode', 'arrivalApplyMode', async () => {
         if (getSettings().arrivalApplyMode === ARRIVAL_APPLY_IMMEDIATE) {
             applyPendingArrivals();
             await saveMetadata();
@@ -6971,7 +7948,7 @@ function bindSettingsUi() {
     });
 
     bindCheckbox('#av_first_name_match', 'triggerNamedCharacterOnFirstUserMessage');
-    bindSelect('#av_first_fallback', 'firstMessageFallback');
+    bindPlainSelect('#av_first_fallback', 'firstMessageFallback');
 
     bindNumber('#av_max_triggers', 'maxTriggersPerMessage', 1, 10);
     bindNumber('#av_max_chain', 'maxChainReplies', 0, 50);
@@ -6981,8 +7958,16 @@ function bindSettingsUi() {
         applyOverlaySettingToVisibleMessages();
     });
 
-    bindCheckbox('#av_hide_character_name', 'hideCharacterNameInRefinedMessage', async () => renderAllVisibleOverlays());
-    bindCheckbox('#av_hide_thoughts', 'hideThoughtsInRefinedMessage', async () => renderAllVisibleOverlays());
+    $('#av_hide_character_name').on('change', async function () {
+        setInvertedBooleanSetting('hideCharacterNameInRefinedMessage', 'showCharacterLabels', !!$(this).prop('checked'));
+        await renderAllVisibleOverlays();
+    });
+
+    $('#av_hide_thoughts').on('change', async function () {
+        setInvertedBooleanSetting('hideThoughtsInRefinedMessage', 'showThoughts', !!$(this).prop('checked'));
+        await renderAllVisibleOverlays();
+    });
+
     bindCheckbox('#av_quote_dialogue', 'quoteDialogue', async () => renderAllVisibleOverlays());
 
     bindSelect('#av_action_style', 'actionDisplayStyle', async () => renderAllVisibleOverlays());
@@ -6990,7 +7975,45 @@ function bindSettingsUi() {
     bindSelect('#av_thoughts_style', 'thoughtsDisplayStyle', async () => renderAllVisibleOverlays());
 
     bindNumber('#av_prompt_depth', 'promptDepth', 0, 100, async () => updateExtensionPrompt());
-    bindCheckbox('#av_hide_debug_toasts', 'hideDebugToasts');
+
+    $('#av_hide_debug_toasts').on('change', function () {
+        setInvertedBooleanSetting('hideDebugToasts', 'showDebugToasts', !!$(this).prop('checked'));
+    });
+
+    $('#av_status_popup_button').on('click', function (event) {
+        stopVocaliaPopupEvent(event);
+        updateDiagnosticsPanel();
+        toggleVocaliaPopup(this, '#aspect_vocalia_status_popup');
+    });
+
+    $('#av_debug_popup_button').on('click', function (event) {
+        stopVocaliaPopupEvent(event);
+        updateDebugLogUi();
+        toggleVocaliaPopup(this, '#aspect_vocalia_debug_popup');
+    });
+
+    $('#aspect_vocalia_settings').on('click', '.aspect-vocalia-popup', function (event) {
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+    });
+
+    $(document)
+        .off('click.aspectVocaliaPopups')
+        .on('click.aspectVocaliaPopups', function (event) {
+            const $target = $(event.target);
+
+            if ($target.closest('#aspect_vocalia_settings .aspect-vocalia-popup-wrap').length) {
+                return;
+            }
+
+            closeVocaliaPopups();
+        });
+
+    $(window)
+        .off('resize.aspectVocaliaPopups scroll.aspectVocaliaPopups')
+        .on('resize.aspectVocaliaPopups scroll.aspectVocaliaPopups', () => {
+            closeVocaliaPopups();
+        });
 
     $('#aspect_vocalia_member_state_table').on('change', '.aspect_vocalia_member_status_select', async function () {
         const avatar = String($(this).attr('data-avatar') ?? '');
@@ -7065,6 +8088,10 @@ function bindSettingsUi() {
         console.log(`[${MODULE_DISPLAY_NAME}] settings`, clone(getSettings()));
         console.log(`[${MODULE_DISPLAY_NAME}] debug bundle`, buildVocaliaDebugBundle());
         globalThis.toastr?.info('Vocalia state logged to console.', MODULE_DISPLAY_NAME);
+    });
+
+    $('#av_reset_extension').on('click', async () => {
+        await resetVocaliaExtension();
     });
 
     loadSettingsUi();
