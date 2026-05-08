@@ -92,12 +92,17 @@ const DEFAULT_SETTINGS = Object.freeze({
 
     autoSetManual: true,
     restoreOriginalStrategyOnDisable: true,
+
+    // Code-only trigger methods. These stay in settings/persistence, but are
+    // intentionally not exposed in the drawer UI.
     useSlashTrigger: true,
     fallbackToInternalGenerate: true,
 
-    maxTriggersPerMessage: 2,
-    maxChainReplies: 8,
-    triggerDelayMs: 350,
+    maxParticipantsPerTurn: 5,
+    maxResponsesPerTurn: 5,
+    maxResponsesPerParticipantPerTurn: 1,
+    triggerDelayMs: 500,
+
     arrivalApplyMode: ARRIVAL_APPLY_IMMEDIATE,
     firstMessageFallback: FIRST_MESSAGE_FALLBACK_RANDOM_PRESENT,
     triggerNamedCharacterOnFirstUserMessage: true,
@@ -124,7 +129,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 });
 
 const DEFAULT_CHAT_STATE = Object.freeze({
-    version: 9,
+    version: 10,
     groupId: null,
     groupName: '',
 
@@ -142,7 +147,11 @@ const DEFAULT_CHAT_STATE = Object.freeze({
     waitingForUserByAvatar: null,
     lastSpeakerAvatar: null,
 
+    // Compatibility / diagnostics array.
     triggeredThisTurn: [],
+
+    // Authoritative per-turn response tracking.
+    participantResponseCountsThisTurn: {},
 
     originalActivationStrategies: {},
 });
@@ -181,6 +190,7 @@ let vocaliaActiveGenerationTargetReason = null;
 // - Own extension settings and chatMetadata persistence.
 // - Migrate legacy Group Speaker Router settings/state into Aspect: Vocalia.
 // - Migrate renamed/inverted settings while keeping old internal call sites safe.
+// - Migrate turn limits from old message/chain wording to true per-turn tracking.
 // ============================================================================
 
 function ctx() {
@@ -214,6 +224,18 @@ function isEnumerableOwnProperty(object, key) {
     return Object.prototype.propertyIsEnumerable.call(object, key);
 }
 
+function clampInteger(value, min, max, fallback) {
+    const number = Number(value);
+    const safe = Number.isFinite(number) ? Math.round(number) : fallback;
+    return Math.min(max, Math.max(min, safe));
+}
+
+function clampNumber(value, min, max, fallback) {
+    const number = Number(value);
+    const safe = Number.isFinite(number) ? number : fallback;
+    return Math.min(max, Math.max(min, safe));
+}
+
 function migrateInvertedBooleanSetting(settings, legacyKey, newKey) {
     if (!Object.hasOwn(settings, newKey)) {
         if (isEnumerableOwnProperty(settings, legacyKey)) {
@@ -239,12 +261,99 @@ function migrateInvertedBooleanSetting(settings, legacyKey, newKey) {
     });
 }
 
+function migrateNumericSetting(settings, legacyKey, newKey, min, max) {
+    if (!Object.hasOwn(settings, newKey)) {
+        if (isEnumerableOwnProperty(settings, legacyKey)) {
+            settings[newKey] = settings[legacyKey];
+        } else {
+            settings[newKey] = clone(DEFAULT_SETTINGS[newKey]);
+        }
+    }
+
+    settings[newKey] = clampInteger(settings[newKey], min, max, DEFAULT_SETTINGS[newKey]);
+
+    if (isEnumerableOwnProperty(settings, legacyKey)) {
+        delete settings[legacyKey];
+    }
+
+    Object.defineProperty(settings, legacyKey, {
+        configurable: true,
+        enumerable: false,
+        get() {
+            return this[newKey];
+        },
+        set(value) {
+            this[newKey] = clampInteger(value, min, max, DEFAULT_SETTINGS[newKey]);
+        },
+    });
+}
+
 function migrateRenamedSettings(settings) {
     migrateInvertedBooleanSetting(settings, 'showCharacterLabels', 'hideCharacterNameInRefinedMessage');
     migrateInvertedBooleanSetting(settings, 'showThoughts', 'hideThoughtsInRefinedMessage');
     migrateInvertedBooleanSetting(settings, 'showDebugToasts', 'hideDebugToasts');
 
+    migrateNumericSetting(settings, 'maxTriggersPerMessage', 'maxParticipantsPerTurn', 1, 10);
+    migrateNumericSetting(settings, 'maxChainReplies', 'maxResponsesPerTurn', 0, 50);
+
+    if (!Object.hasOwn(settings, 'maxResponsesPerParticipantPerTurn')) {
+        settings.maxResponsesPerParticipantPerTurn = clone(DEFAULT_SETTINGS.maxResponsesPerParticipantPerTurn);
+    }
+
+    settings.maxParticipantsPerTurn = clampInteger(settings.maxParticipantsPerTurn, 1, 10, DEFAULT_SETTINGS.maxParticipantsPerTurn);
+    settings.maxResponsesPerTurn = clampInteger(settings.maxResponsesPerTurn, 0, 50, DEFAULT_SETTINGS.maxResponsesPerTurn);
+    settings.maxResponsesPerParticipantPerTurn = clampInteger(settings.maxResponsesPerParticipantPerTurn, 1, 3, DEFAULT_SETTINGS.maxResponsesPerParticipantPerTurn);
+    settings.triggerDelayMs = Math.round(clampNumber(settings.triggerDelayMs, 0, 10000, DEFAULT_SETTINGS.triggerDelayMs));
+
     return settings;
+}
+
+function migrateTurnTrackingState(state) {
+    state.triggeredThisTurn ??= [];
+    state.participantResponseCountsThisTurn ??= {};
+
+    if (
+        (!state.participantResponseCountsThisTurn || typeof state.participantResponseCountsThisTurn !== 'object' || Array.isArray(state.participantResponseCountsThisTurn))
+    ) {
+        state.participantResponseCountsThisTurn = {};
+    }
+
+    // If an older chat-state only had triggeredThisTurn, convert it into counts.
+    if (
+        Object.keys(state.participantResponseCountsThisTurn).length === 0
+        && Array.isArray(state.triggeredThisTurn)
+        && state.triggeredThisTurn.length
+    ) {
+        for (const avatar of state.triggeredThisTurn) {
+            if (avatar) state.participantResponseCountsThisTurn[avatar] = 1;
+        }
+    }
+
+    // Existing code paths reset the old array and chainCount at the start of a
+    // user turn. Treat that as an explicit reset for the new count map too.
+    if (
+        Array.isArray(state.triggeredThisTurn)
+        && state.triggeredThisTurn.length === 0
+        && Number(state.chainCount || 0) === 0
+    ) {
+        state.participantResponseCountsThisTurn = {};
+    }
+
+    const cleanCounts = {};
+    for (const [avatar, count] of Object.entries(state.participantResponseCountsThisTurn ?? {})) {
+        const safeCount = clampInteger(count, 0, 100, 0);
+        if (avatar && safeCount > 0) cleanCounts[avatar] = safeCount;
+    }
+
+    state.participantResponseCountsThisTurn = cleanCounts;
+    state.triggeredThisTurn = Object.keys(cleanCounts);
+
+    const totalFromCounts = Object.values(cleanCounts).reduce((sum, count) => sum + Number(count || 0), 0);
+    if (totalFromCounts > Number(state.chainCount || 0)) {
+        state.chainCount = totalFromCounts;
+    }
+
+    return state;
 }
 
 function getSettings() {
@@ -269,6 +378,8 @@ function getChatState() {
     for (const [key, value] of Object.entries(DEFAULT_CHAT_STATE)) {
         if (!Object.hasOwn(state, key)) state[key] = clone(value);
     }
+
+    migrateTurnTrackingState(state);
 
     return state;
 }
@@ -575,21 +686,28 @@ function getSettingsDebugSnapshot() {
     return {
         enabled: settings.enabled,
         autoSetManual: settings.autoSetManual,
+        restoreOriginalStrategyOnDisable: settings.restoreOriginalStrategyOnDisable,
         useSlashTrigger: settings.useSlashTrigger,
         fallbackToInternalGenerate: settings.fallbackToInternalGenerate,
-        maxTriggersPerMessage: settings.maxTriggersPerMessage,
-        maxChainReplies: settings.maxChainReplies,
+        maxParticipantsPerTurn: settings.maxParticipantsPerTurn,
+        maxResponsesPerTurn: settings.maxResponsesPerTurn,
+        maxResponsesPerParticipantPerTurn: settings.maxResponsesPerParticipantPerTurn,
         triggerDelayMs: settings.triggerDelayMs,
         triggerMessageTimeoutMs: getTriggerMessageTimeoutMs(),
         arrivalApplyMode: settings.arrivalApplyMode,
         firstMessageFallback: settings.firstMessageFallback,
         triggerNamedCharacterOnFirstUserMessage: settings.triggerNamedCharacterOnFirstUserMessage,
+        occludeUnwitnessedHistory: settings.occludeUnwitnessedHistory,
         renderOverlay: settings.renderOverlay,
+        hideEmptySections: settings.hideEmptySections,
+        hideCharacterNameInRefinedMessage: settings.hideCharacterNameInRefinedMessage,
+        hideThoughtsInRefinedMessage: settings.hideThoughtsInRefinedMessage,
         quoteDialogue: settings.quoteDialogue,
         actionDisplayStyle: settings.actionDisplayStyle,
         narrationDisplayStyle: settings.narrationDisplayStyle,
         thoughtsDisplayStyle: settings.thoughtsDisplayStyle,
         promptDepth: settings.promptDepth,
+        hideDebugToasts: settings.hideDebugToasts,
     };
 }
 
@@ -1507,7 +1625,7 @@ function getMessageText(messageId) {
 }
 
 function getMaxTriggerTargets() {
-    return Math.max(1, Number(getSettings().maxTriggersPerMessage) || 1);
+    return Math.max(1, Number(getSettings().maxParticipantsPerTurn) || 1);
 }
 
 function limitTriggerTargets(members) {
@@ -3052,6 +3170,7 @@ async function restoreOriginalStrategyForCurrentGroup() {
 // - Make routing metadata strict: exactly one parameters segment, no duplicate keys.
 // - Make the LLM responsible for deciding whether purposeful arrivals speak.
 // - Support multiple next speakers when more than one response makes sense.
+// - Prevent raw semantic segments from using Markdown/SillyTavern display wrappers.
 // ============================================================================
 
 function buildInstructionPrompt() {
@@ -3070,6 +3189,9 @@ function buildInstructionPrompt() {
         .join(', ') || 'none';
 
     const hasRemoteSupport = typeof getRemoteMembers === 'function';
+    const maxParticipants = Math.max(1, Number(settings.maxParticipantsPerTurn) || 1);
+    const maxResponses = Math.max(0, Number(settings.maxResponsesPerTurn) || 0);
+    const maxPerParticipant = Math.max(1, Number(settings.maxResponsesPerParticipantPerTurn) || 1);
 
     return [
         '[Aspect: Vocalia Group Speaker Router Protocol - mandatory]',
@@ -3090,44 +3212,34 @@ function buildInstructionPrompt() {
         `Correct outer wrapper: [${tagPrefix}1=Mikasa Ackerman] ... [end ${tagPrefix}1]`,
         '',
         'Inside the character block, compose the visible message from ordered semantic segments.',
+        'Segment tags are semantic containers only. They are not style instructions.',
+        'Do not use Markdown or SillyTavern formatting wrappers inside segment content.',
+        'Never wrap [actions], [narration], or [thoughts] content in *asterisks*, **bold markers**, ***bold italic markers***, underscores, tildes, or other visual-formatting syntax.',
+        'Vocalia applies visual styling later in the Refined Message renderer.',
+        '',
         'You may use these visible-content segment tags multiple times and in any order:',
         '[dialogue]spoken words only; no actions, no narration, no thoughts[end dialogue]',
         '[actions]only the active speaker’s deliberate physical action, body movement, facial expression, posture, gesture, voice action, or object interaction[end actions]',
         '[narration]only non-speaker-specific scene description, environment, atmosphere, timing, crowd reaction, consequences, or details not physically performed by the active speaker[end narration]',
         '[thoughts]private/internal thought of the active speaker only[end thoughts]',
         '',
+        'Raw segment formatting examples:',
+        'Wrong: [actions]*She tightens her grip and steps forward.*[end actions]',
+        'Correct: [actions]She tightens her grip and steps forward.[end actions]',
+        'Wrong: [narration]*The corridor falls silent.*[end narration]',
+        'Correct: [narration]The corridor falls silent.[end narration]',
+        'Wrong: [thoughts]*I need to be careful.*[end thoughts]',
+        'Correct: [thoughts]I need to be careful.[end thoughts]',
+        '',
         'End every character block with exactly one parameters segment.',
         hasRemoteSupport
-            ? '[parameters]speakingTo=ExactName|ExactName|user|none,participationNextTurn=speak|idle|departing,arriving=ExactName|ExactName|none,remote=ExactName|ExactName|none[end parameters]'
-            : '[parameters]speakingTo=ExactName|ExactName|user|none,participationNextTurn=speak|idle|departing,arriving=ExactName|ExactName|none[end parameters]',
+            ? '[parameters]speakingTo=ExactName|user|none, participationNextTurn=speak|idle|departing, arriving=ExactName|none, remote=ExactName|none[end parameters]'
+            : '[parameters]speakingTo=ExactName|user|none, participationNextTurn=speak|idle|departing, arriving=ExactName|none[end parameters]',
         '',
-        'Hard parameter rules:',
-        '- The [parameters] segment must appear exactly once.',
-        '- Each parameter key must appear exactly once. Duplicate keys are forbidden and make the block invalid.',
-        '- Forbidden: arriving=Mikasa Ackerman,arriving=none.',
-        '- Forbidden: speakingTo=user,speakingTo=Mikasa Ackerman.',
-        '- Required keys: speakingTo, participationNextTurn, arriving.',
-        hasRemoteSupport ? '- Use remote=none when no remote contact is active.' : '',
-        '- Never include both a real value and none for the same parameter key.',
-        '',
-        'Content rules:',
-        '- [dialogue] contains only spoken words. Do not include action or narration inside [dialogue].',
-        '- [actions] is strictly limited to the active speaker’s own physical behavior or voice action.',
-        '- [narration] is required for environment, atmosphere, crowd response, timing, external consequences, or anything not directly performed by the active speaker.',
-        '- [thoughts] contains only the active speaker’s private/internal thoughts.',
-        '- Use multiple ordered segments when needed to preserve the desired final reading order.',
-        '- Do not wrap [actions], [narration], or [thoughts] content in Markdown asterisks or underscores.',
-        '- Do not add quote marks around [dialogue]; Aspect: Vocalia controls dialogue quote display in the overlay.',
-        '- Never send an empty response. At least one visible segment must contain meaningful text.',
-        '',
-        'Physical arrival rules:',
-        '- arriving=ExactName means an absent group member physically enters, physically joins, or becomes physically present in the scene.',
-        '- If an absent group member is called, summoned, physically noticed, requested to join, or established as nearby and expected to physically join, set arriving=ExactName.',
-        '- If the active speaker calls, shouts for, summons, or requests an absent group member and the scene does not explicitly establish that the call fails, do not use arriving=none for that group member.',
-        '- Do not use arriving for mere mentions, memories, assumptions, or names appearing in dialogue unless the scene state actually changes to physical presence.',
-        '- Do not use arriving for phone calls, radio calls, video calls, intercoms, text messages, or other remote communication.',
-        '- arriving=ExactName only updates physical scene presence. It does not automatically make that character speak next.',
-        '- If the arriving character is called over, summoned for a reason, expected to answer, expected to introduce themselves, or is the natural next beat, set speakingTo=ExactName and participationNextTurn=speak.',
+        'Arrival rules:',
+        '- arriving=ExactName means an absent group member physically enters, appears, is reached in the same physical scene, or is established as arriving into the active scene.',
+        '- If an absent group member is called, summoned, physically noticed, encountered, or established as nearby and expected to join, include them in arriving=ExactName.',
+        '- A purposeful arrival may speak when it makes scene sense. If that arriving character should speak next, set speakingTo=ExactName and participationNextTurn=speak.',
         '- If the arriving character deliberately enters silently, stays in the background, watches, listens, or should not speak yet, use arriving=ExactName with participationNextTurn=idle and speakingTo=user|none as appropriate.',
         '',
         hasRemoteSupport ? 'Remote participation rules:' : '',
@@ -3141,23 +3253,23 @@ function buildInstructionPrompt() {
         '- Multiple group members may respond in one user turn when it makes scene sense.',
         '- To trigger multiple next speakers, set speakingTo=ExactName|ExactName and participationNextTurn=speak.',
         '- The order of names in speakingTo is the order Aspect: Vocalia should attempt to trigger them.',
-        `- Do not name more than ${Math.max(1, Number(settings.maxTriggersPerMessage) || 1)} next speakers unless absolutely necessary.`,
-        '- Each eligible group member still has only one automatic trigger allowance per user turn.',
+        `- Do not name more than ${maxParticipants} unique next speakers unless absolutely necessary.`,
+        `- Vocalia may allow up to ${maxParticipants} unique participants, ${maxResponses} total assistant responses, and ${maxPerParticipant} response(s) per participant in the current user turn.`,
         '',
         'Parameter behavior rules:',
         '- speakingTo names who should answer next. Use exact group member names separated by |, or user, or none.',
         '- speakingTo=user means the human/persona should answer next. Never use user to refer to a group member.',
         '- If a group member should answer next, use that group member’s exact name from the group member list, not user.',
         hasRemoteSupport
-            ? '- participationNextTurn=speak means Aspect: Vocalia may trigger the named group member(s) in speakingTo if they are physically present or remote and have not already been triggered this user turn.'
-            : '- participationNextTurn=speak means Aspect: Vocalia may trigger the named group member(s) in speakingTo if they are present and have not already been triggered this user turn.',
+            ? '- participationNextTurn=speak means Aspect: Vocalia may trigger the named group member(s) in speakingTo if they are physically present or remote and still fit the current turn limits.'
+            : '- participationNextTurn=speak means Aspect: Vocalia may trigger the named group member(s) in speakingTo if they are present and still fit the current turn limits.',
         '- participationNextTurn=idle means the active speaker is not proactively handing the floor to another assistant now. It does not prevent this character from answering the user later.',
         '- participationNextTurn=departing means the active speaker leaves the scene after this response and becomes absent.',
         '- Arrival declarations may appear in any valid assistant response when the scene state changes. Do not restrict arrivals to the first assistant response after a user message.',
         '- Do not use a separate departing= parameter. Owner departure is only participationNextTurn=departing.',
         '- Do not invent character names outside the group member list.',
-        '- After each eligible character has spoken once, stop and wait for the user.',
-        settings.strictPrompt ? '- Malformed tags or duplicate parameters break routing. Exact tags, exact names, and unique parameter keys are more important than prose style.' : '',
+        '- When the scene no longer needs additional assistant responses, stop and wait for the user.',
+        settings.strictPrompt ? '- Malformed tags or duplicate parameters break routing. Exact tags, exact names, unique parameter keys, and unwrapped semantic segment text are more important than prose style.' : '',
         '[End Aspect: Vocalia Group Speaker Router Protocol]',
     ].filter(Boolean).join('\n');
 }
@@ -3466,8 +3578,9 @@ function firstValidOwnerBlock(blocks, message) {
 // - Render parsed blocks as semantic HTML.
 // - Respect ordered dialogue/actions/narration/thoughts segments.
 // - Support refined-message display styles from drawer settings.
-// - Use SillyTavern's own messageFormatting() only as a leaf renderer for
-//   explicit quote/asterisk-wrapped segment display.
+// - Strip accidental raw SillyTavern/Markdown wrappers from semantic segments.
+// - Use CSS for all refined-message styles except Muted Italics.
+// - Use SillyTavern's native asterisk formatting only for Muted Italics.
 // - Avoid passing the full reconstructed message through Markdown as one blob.
 // ============================================================================
 
@@ -3495,6 +3608,36 @@ function stripOneBalancedOuterQuotePair(value) {
     return text;
 }
 
+function stripOneBalancedOuterAsteriskWrapper(value) {
+    const text = normalizePlainSegmentText(value);
+    if (!text) return '';
+
+    for (const marker of ['***', '**', '*']) {
+        if (
+            text.length > marker.length * 2
+            && text.startsWith(marker)
+            && text.endsWith(marker)
+        ) {
+            return text.slice(marker.length, text.length - marker.length).trim();
+        }
+    }
+
+    return text;
+}
+
+function stripAccidentalRawSegmentFormatting(value) {
+    let text = normalizePlainSegmentText(value);
+    if (!text) return '';
+
+    for (let index = 0; index < 3; index += 1) {
+        const stripped = stripOneBalancedOuterAsteriskWrapper(text);
+        if (stripped === text) break;
+        text = stripped;
+    }
+
+    return text;
+}
+
 function buildDialogueDisplayText(value) {
     const text = stripOneBalancedOuterQuotePair(value);
     if (!text) return '';
@@ -3510,44 +3653,66 @@ function normalizeOverlayStyle(style) {
 
     const allowed = new Set([
         OVERLAY_STYLE_PLAIN,
-        OVERLAY_STYLE_ITALIC,
-        OVERLAY_STYLE_ASTERISKS,
+        'muted',
+
         OVERLAY_STYLE_BOLD,
+        OVERLAY_STYLE_ITALIC,
         OVERLAY_STYLE_BOLD_ITALIC,
+        'muted_bold',
+        OVERLAY_STYLE_ASTERISKS,
+
         OVERLAY_STYLE_UNDERLINE,
+        'muted_underline',
+
         OVERLAY_STYLE_STRIKE,
+        'muted_strike',
+
         OVERLAY_STYLE_UPPERCASE,
+        'muted_uppercase',
+
         OVERLAY_STYLE_LOWERCASE,
+        'muted_lowercase',
     ]);
 
     return allowed.has(value) ? value : OVERLAY_STYLE_PLAIN;
 }
 
 function buildStyledSegmentDisplayText(value, displayStyle) {
-    const text = normalizePlainSegmentText(value);
+    const text = stripAccidentalRawSegmentFormatting(value);
     if (!text) return '';
 
     const normalizedStyle = normalizeOverlayStyle(displayStyle);
 
     switch (normalizedStyle) {
-        case OVERLAY_STYLE_ASTERISKS:
-            return `*${text}*`;
-
         case OVERLAY_STYLE_UPPERCASE:
+        case 'muted_uppercase':
             return text.toLocaleUpperCase();
 
         case OVERLAY_STYLE_LOWERCASE:
+        case 'muted_lowercase':
             return text.toLocaleLowerCase();
 
+        case OVERLAY_STYLE_ASTERISKS:
         case OVERLAY_STYLE_BOLD:
         case OVERLAY_STYLE_BOLD_ITALIC:
         case OVERLAY_STYLE_ITALIC:
         case OVERLAY_STYLE_UNDERLINE:
         case OVERLAY_STYLE_STRIKE:
         case OVERLAY_STYLE_PLAIN:
+        case 'muted':
+        case 'muted_bold':
+        case 'muted_underline':
+        case 'muted_strike':
         default:
             return text;
     }
+}
+
+function buildNativeMutedItalicsDisplayText(value) {
+    const text = stripAccidentalRawSegmentFormatting(value);
+    if (!text) return '';
+
+    return `*${text}*`;
 }
 
 function shouldUseSillyTavernFormattingForSegment(segmentType, displayStyle) {
@@ -3581,7 +3746,7 @@ function createOverlaySpan(className, text) {
     return span;
 }
 
-function createFormattedSegmentElement(className, displayText, message, messageId) {
+function createFormattedSegmentElement(className, displayText, message, messageId, fallbackText = displayText) {
     const span = document.createElement('span');
     span.className = `${className} aspect-vocalia-formatted`;
 
@@ -3602,8 +3767,38 @@ function createFormattedSegmentElement(className, displayText, message, messageI
         }
     }
 
-    span.textContent = displayText;
+    span.textContent = fallbackText;
     return span;
+}
+
+function appendStyledNonDialogueSegment(parent, segment, message, messageId, segmentClassName, displayStyle) {
+    const normalizedStyle = normalizeOverlayStyle(displayStyle);
+    const rawText = normalizePlainSegmentText(segment.text);
+    if (!rawText) return;
+
+    const cleanText = stripAccidentalRawSegmentFormatting(rawText);
+    if (!cleanText) return;
+
+    const paragraph = document.createElement('div');
+    paragraph.className = `aspect-vocalia-segment aspect-vocalia-segment-${segment.type}`;
+    paragraph.dataset.displayStyle = normalizedStyle;
+
+    if (shouldUseSillyTavernFormattingForSegment(segment.type, normalizedStyle)) {
+        paragraph.append(createFormattedSegmentElement(
+            segmentClassName,
+            buildNativeMutedItalicsDisplayText(cleanText),
+            message,
+            messageId,
+            cleanText,
+        ));
+    } else {
+        paragraph.append(createOverlaySpan(
+            segmentClassName,
+            buildStyledSegmentDisplayText(cleanText, normalizedStyle),
+        ));
+    }
+
+    parent.append(paragraph);
 }
 
 function appendSegmentElement(parent, segment, block, message, messageId) {
@@ -3611,79 +3806,70 @@ function appendSegmentElement(parent, segment, block, message, messageId) {
     const rawText = normalizePlainSegmentText(segment.text);
     if (!rawText) return;
 
-    const paragraph = document.createElement('div');
-    paragraph.className = `aspect-vocalia-segment aspect-vocalia-segment-${segment.type}`;
-
     switch (segment.type) {
         case SEGMENT_DIALOGUE: {
             const displayText = buildDialogueDisplayText(rawText);
             if (!displayText) return;
 
-            if (shouldUseSillyTavernFormattingForSegment(segment.type, null)) {
-                paragraph.append(createFormattedSegmentElement('aspect-vocalia-dialogue', displayText, message, messageId));
+            const paragraph = document.createElement('div');
+            paragraph.className = `aspect-vocalia-segment aspect-vocalia-segment-${segment.type}`;
+            paragraph.dataset.displayStyle = OVERLAY_STYLE_PLAIN;
+
+            if (settings.quoteDialogue) {
+                paragraph.append(createFormattedSegmentElement(
+                    'aspect-vocalia-dialogue',
+                    displayText,
+                    message,
+                    messageId,
+                    displayText,
+                ));
             } else {
                 paragraph.append(createOverlaySpan('aspect-vocalia-dialogue', displayText));
             }
 
+            parent.append(paragraph);
             break;
         }
 
-        case SEGMENT_ACTIONS: {
-            const displayStyle = normalizeOverlayStyle(settings.actionDisplayStyle);
-            const displayText = buildStyledSegmentDisplayText(rawText, displayStyle);
-            if (!displayText) return;
-
-            paragraph.dataset.displayStyle = displayStyle;
-
-            if (shouldUseSillyTavernFormattingForSegment(segment.type, displayStyle)) {
-                paragraph.append(createFormattedSegmentElement('aspect-vocalia-actions', displayText, message, messageId));
-            } else {
-                paragraph.append(createOverlaySpan('aspect-vocalia-actions', displayText));
-            }
-
+        case SEGMENT_ACTIONS:
+            appendStyledNonDialogueSegment(
+                parent,
+                segment,
+                message,
+                messageId,
+                'aspect-vocalia-actions',
+                settings.actionDisplayStyle,
+            );
             break;
-        }
 
-        case SEGMENT_NARRATION: {
-            const displayStyle = normalizeOverlayStyle(settings.narrationDisplayStyle);
-            const displayText = buildStyledSegmentDisplayText(rawText, displayStyle);
-            if (!displayText) return;
-
-            paragraph.dataset.displayStyle = displayStyle;
-
-            if (shouldUseSillyTavernFormattingForSegment(segment.type, displayStyle)) {
-                paragraph.append(createFormattedSegmentElement('aspect-vocalia-narration', displayText, message, messageId));
-            } else {
-                paragraph.append(createOverlaySpan('aspect-vocalia-narration', displayText));
-            }
-
+        case SEGMENT_NARRATION:
+            appendStyledNonDialogueSegment(
+                parent,
+                segment,
+                message,
+                messageId,
+                'aspect-vocalia-narration',
+                settings.narrationDisplayStyle,
+            );
             break;
-        }
 
-        case SEGMENT_THOUGHTS: {
+        case SEGMENT_THOUGHTS:
             if (!shouldShowRefinedThoughts(settings)) return;
 
-            const displayStyle = normalizeOverlayStyle(settings.thoughtsDisplayStyle);
-            const displayText = buildStyledSegmentDisplayText(rawText, displayStyle);
-            if (!displayText) return;
-
-            paragraph.dataset.displayStyle = displayStyle;
-
-            if (shouldUseSillyTavernFormattingForSegment(segment.type, displayStyle)) {
-                paragraph.append(createFormattedSegmentElement('aspect-vocalia-thoughts', displayText, message, messageId));
-            } else {
-                paragraph.append(createOverlaySpan('aspect-vocalia-thoughts', displayText));
-            }
-
+            appendStyledNonDialogueSegment(
+                parent,
+                segment,
+                message,
+                messageId,
+                'aspect-vocalia-thoughts',
+                settings.thoughtsDisplayStyle,
+            );
             break;
-        }
 
         case SEGMENT_PARAMETERS:
         default:
             return;
     }
-
-    parent.append(paragraph);
 }
 
 function createBlockOverlayElement(block, message, messageId) {
@@ -4316,8 +4502,8 @@ async function triggerMember(member) {
 // ============================================================================
 // Purpose:
 // - Serialize group member triggers.
-// - Enforce max chain length.
-// - Enforce one automatic trigger allowance per assistant per user turn.
+// - Enforce true per-turn unique-participant and total-response limits.
+// - Enforce per-participant response limits.
 // - Wait for the triggered assistant's actual MESSAGE_RECEIVED before continuing.
 // - Expose the active target avatar for the generate_interceptor.
 // - Handle deferred-arrival application at chain end.
@@ -4358,33 +4544,92 @@ function getActiveGenerationTargetMember() {
     return getMemberByAvatar(vocaliaActiveGenerationTargetAvatar, getGroupMembers());
 }
 
+function syncTriggeredThisTurnFromCounts(state = getChatState()) {
+    const counts = state.participantResponseCountsThisTurn ?? {};
+    state.triggeredThisTurn = Object.entries(counts)
+        .filter(([_avatar, count]) => Number(count || 0) > 0)
+        .map(([avatar]) => avatar);
+
+    return state.triggeredThisTurn;
+}
+
+function resetTurnResponseTracking(state = getChatState()) {
+    state.chainCount = 0;
+    state.triggeredThisTurn = [];
+    state.participantResponseCountsThisTurn = {};
+}
+
+function getParticipantResponseCountsThisTurn(state = getChatState()) {
+    state.participantResponseCountsThisTurn ??= {};
+    migrateTurnTrackingState(state);
+    return state.participantResponseCountsThisTurn;
+}
+
 function getTriggeredThisTurnSet() {
-    const state = getChatState();
-    state.triggeredThisTurn ??= [];
-    state.triggeredThisTurn = [...new Set(state.triggeredThisTurn)];
-    return new Set(state.triggeredThisTurn);
+    return new Set(syncTriggeredThisTurnFromCounts(getChatState()));
+}
+
+function getParticipantResponseCount(memberOrAvatar, state = getChatState()) {
+    const avatar = typeof memberOrAvatar === 'string' ? memberOrAvatar : memberOrAvatar?.avatar;
+    if (!avatar) return 0;
+
+    const counts = getParticipantResponseCountsThisTurn(state);
+    return Number(counts[avatar] || 0);
 }
 
 function hasTriggeredThisTurn(member) {
     if (!member) return true;
-    return getTriggeredThisTurnSet().has(member.avatar);
+    return getParticipantResponseCount(member) > 0;
+}
+
+function getTotalResponsesThisTurn(state = getChatState()) {
+    const counts = getParticipantResponseCountsThisTurn(state);
+    return Object.values(counts).reduce((sum, count) => sum + Number(count || 0), 0);
+}
+
+function getUniqueParticipantsThisTurn(state = getChatState()) {
+    const counts = getParticipantResponseCountsThisTurn(state);
+    return Object.values(counts).filter(count => Number(count || 0) > 0).length;
+}
+
+function getQueuedResponseCounts() {
+    const queuedCounts = {};
+
+    for (const item of triggerQueue) {
+        const avatar = item?.member?.avatar;
+        if (!avatar) continue;
+        queuedCounts[avatar] = Number(queuedCounts[avatar] || 0) + 1;
+    }
+
+    return queuedCounts;
+}
+
+function getTurnLimitSettings() {
+    const settings = getSettings();
+
+    return {
+        maxParticipantsPerTurn: clampInteger(settings.maxParticipantsPerTurn, 1, 10, DEFAULT_SETTINGS.maxParticipantsPerTurn),
+        maxResponsesPerTurn: clampInteger(settings.maxResponsesPerTurn, 0, 50, DEFAULT_SETTINGS.maxResponsesPerTurn),
+        maxResponsesPerParticipantPerTurn: clampInteger(settings.maxResponsesPerParticipantPerTurn, 1, 3, DEFAULT_SETTINGS.maxResponsesPerParticipantPerTurn),
+    };
 }
 
 function markTriggeredThisTurn(member) {
     if (!member) return;
 
     const state = getChatState();
-    state.triggeredThisTurn ??= [];
+    const counts = getParticipantResponseCountsThisTurn(state);
 
-    if (!state.triggeredThisTurn.includes(member.avatar)) {
-        state.triggeredThisTurn.push(member.avatar);
-    }
-
-    state.triggeredThisTurn = [...new Set(state.triggeredThisTurn)];
+    counts[member.avatar] = Number(counts[member.avatar] || 0) + 1;
+    state.chainCount = getTotalResponsesThisTurn(state);
+    syncTriggeredThisTurnFromCounts(state);
 
     logVocaliaEvent('allowance.mark_spent', {
         member: memberDebugSummary(member),
+        participantResponseCountsThisTurn: safeLogClone(state.participantResponseCountsThisTurn),
         triggeredThisTurn: arrayDebugNames(state.triggeredThisTurn),
+        totalResponsesThisTurn: getTotalResponsesThisTurn(state),
+        uniqueParticipantsThisTurn: getUniqueParticipantsThisTurn(state),
     });
 }
 
@@ -4394,15 +4639,26 @@ function unmarkTriggeredThisTurn(memberOrAvatar, reason = 'unspecified') {
 
     if (!avatar) return;
 
-    const before = [...(state.triggeredThisTurn ?? [])];
-    state.triggeredThisTurn = before.filter(item => item !== avatar);
+    const beforeCounts = safeLogClone(state.participantResponseCountsThisTurn ?? {});
+    const counts = getParticipantResponseCountsThisTurn(state);
+    const current = Number(counts[avatar] || 0);
+
+    if (current > 1) {
+        counts[avatar] = current - 1;
+    } else {
+        delete counts[avatar];
+    }
+
+    state.chainCount = getTotalResponsesThisTurn(state);
+    syncTriggeredThisTurnFromCounts(state);
 
     logVocaliaEvent('allowance.mark_released', {
         avatar,
         name: avatarToDebugName(avatar),
         reason,
-        before: arrayDebugNames(before),
-        after: arrayDebugNames(state.triggeredThisTurn),
+        beforeCounts,
+        afterCounts: safeLogClone(state.participantResponseCountsThisTurn),
+        triggeredThisTurn: arrayDebugNames(state.triggeredThisTurn),
     });
 }
 
@@ -4432,81 +4688,100 @@ function isRouteEligibleForQueue(member) {
 }
 
 function filterTriggerAllowance(members) {
+    const state = getChatState();
+    const limits = getTurnLimitSettings();
     const evaluations = [];
+    const accepted = [];
 
-    const allowed = uniqueMembers(members).filter(member => {
+    const projectedCounts = {
+        ...(state.participantResponseCountsThisTurn ?? {}),
+    };
+
+    for (const [avatar, count] of Object.entries(getQueuedResponseCounts())) {
+        projectedCounts[avatar] = Number(projectedCounts[avatar] || 0) + Number(count || 0);
+    }
+
+    const getProjectedTotal = () => Object.values(projectedCounts).reduce((sum, count) => sum + Number(count || 0), 0);
+    const getProjectedUnique = () => Object.values(projectedCounts).filter(count => Number(count || 0) > 0).length;
+
+    for (const member of uniqueMembers(members)) {
         const reasons = [];
 
         if (!member) {
             reasons.push('missing_member');
         } else {
+            const currentCount = Number(projectedCounts[member.avatar] || 0);
+
             if (!isRouteEligibleForQueue(member)) {
                 reasons.push('not_present_or_remote');
-            }
-
-            if (hasTriggeredThisTurn(member)) {
-                reasons.push('already_triggered_this_turn');
             }
 
             if (isAlreadyQueuedThisTurn(member)) {
                 reasons.push('already_queued');
             }
+
+            if (getProjectedTotal() >= limits.maxResponsesPerTurn) {
+                reasons.push('max_responses_per_turn_reached');
+            }
+
+            if (currentCount <= 0 && getProjectedUnique() >= limits.maxParticipantsPerTurn) {
+                reasons.push('max_participants_per_turn_reached');
+            }
+
+            if (currentCount >= limits.maxResponsesPerParticipantPerTurn) {
+                reasons.push('max_responses_per_participant_per_turn_reached');
+            }
         }
 
-        const accepted = !!member && reasons.length === 0;
+        const acceptedMember = !!member && reasons.length === 0;
 
         evaluations.push({
             member: memberDebugSummary(member),
-            accepted,
+            accepted: acceptedMember,
             reasons,
+            projected: member ? {
+                currentCount: Number(projectedCounts[member.avatar] || 0),
+                totalResponses: getProjectedTotal(),
+                uniqueParticipants: getProjectedUnique(),
+            } : null,
         });
 
-        return accepted;
-    });
+        if (!acceptedMember) continue;
+
+        accepted.push(member);
+        projectedCounts[member.avatar] = Number(projectedCounts[member.avatar] || 0) + 1;
+    }
 
     logVocaliaEvent('allowance.filter', {
         incoming: members.map(memberDebugSummary),
         evaluations,
-        allowed: allowed.map(memberDebugSummary),
+        allowed: accepted.map(memberDebugSummary),
+        limits,
+        actualCounts: safeLogClone(state.participantResponseCountsThisTurn ?? {}),
+        projectedCounts,
     });
 
-    return allowed;
+    return accepted;
 }
 
 function enqueueTriggers(members, sourceMessageId, reason = 'metadata') {
-    const settings = getSettings();
     const state = getChatState();
-    const maxChain = Math.max(0, Number(settings.maxChainReplies) || 0);
+    const limits = getTurnLimitSettings();
 
     logVocaliaEvent('queue.enqueue.start', {
         sourceMessageId,
         reason,
         incomingMembers: members.map(memberDebugSummary),
-        maxChain,
+        limits,
+        currentCounts: safeLogClone(state.participantResponseCountsThisTurn ?? {}),
         currentChainCount: state.chainCount,
     });
 
-    if (!members.length || maxChain <= 0) {
+    if (!members.length || limits.maxResponsesPerTurn <= 0) {
         logVocaliaEvent('queue.enqueue.refused', {
             sourceMessageId,
             reason,
-            cause: !members.length ? 'no_members' : 'max_chain_zero',
-        });
-
-        maybeApplyDeferredArrivalsAtChainEnd();
-        return;
-    }
-
-    const remaining = Math.max(0, maxChain - Number(state.chainCount || 0));
-    if (remaining <= 0) {
-        debugToast('Router chain limit reached; no further members triggered.');
-
-        logVocaliaEvent('queue.enqueue.refused', {
-            sourceMessageId,
-            reason,
-            cause: 'chain_limit_reached',
-            maxChain,
-            chainCount: state.chainCount,
+            cause: !members.length ? 'no_members' : 'max_responses_per_turn_zero',
         });
 
         maybeApplyDeferredArrivalsAtChainEnd();
@@ -4528,8 +4803,7 @@ function enqueueTriggers(members, sourceMessageId, reason = 'metadata') {
         return;
     }
 
-    const limited = allowed.slice(0, remaining);
-    for (const member of limited) {
+    for (const member of allowed) {
         triggerQueue.push({
             member,
             sourceMessageId,
@@ -4541,7 +4815,7 @@ function enqueueTriggers(members, sourceMessageId, reason = 'metadata') {
     logVocaliaEvent('queue.enqueue.end', {
         sourceMessageId,
         reason,
-        queued: limited.map(memberDebugSummary),
+        queued: allowed.map(memberDebugSummary),
     });
 
     updateDiagnosticsPanel();
@@ -4615,6 +4889,7 @@ async function runTriggerQueue() {
                 remote: arrayDebugNames(state.remote),
                 absent: arrayDebugNames(state.absent),
                 pendingArrivals: arrayDebugNames(state.pendingArrivals),
+                participantResponseCountsThisTurn: safeLogClone(state.participantResponseCountsThisTurn ?? {}),
             });
 
             if (!item?.member || !isRouteEligibleForQueue(item.member)) {
@@ -4647,12 +4922,15 @@ async function runTriggerQueue() {
                 continue;
             }
 
-            if (hasTriggeredThisTurn(latestMember)) {
-                debugToast(`${latestMember.name} was skipped because they already spoke this user turn.`);
+            const allowedNow = filterTriggerAllowance([latestMember]);
+            if (!allowedNow.length) {
+                debugToast(`${latestMember.name} was skipped because they reached a Vocalia turn limit.`);
 
                 logVocaliaEvent('queue.item.skipped', {
-                    reason: 'already_triggered_this_turn',
+                    reason: 'turn_limit_reached',
                     latestMember: memberDebugSummary(latestMember),
+                    limits: getTurnLimitSettings(),
+                    counts: safeLogClone(getChatState().participantResponseCountsThisTurn ?? {}),
                 });
 
                 continue;
@@ -4671,7 +4949,6 @@ async function runTriggerQueue() {
             });
 
             markTriggeredThisTurn(latestMember);
-            getChatState().chainCount = Number(getChatState().chainCount || 0) + 1;
             await saveMetadata();
             updateDiagnosticsPanel();
 
@@ -6400,22 +6677,23 @@ const VOCALIA_LABEL_HELP = Object.freeze({
     enabled: 'Turns Aspect: Vocalia on or off. When disabled, Vocalia stops injecting protocol instructions, routing speakers, intercepting native group generation, and rendering refined messages.',
     reset_extension: 'Restores Vocalia settings to defaults, clears Vocalia state for the current chat, stops active queues, clears active debug state, and resyncs the current group state.',
 
-    runtime: 'Controls how Vocalia integrates with SillyTavern group generation and speaker triggering.',
+    runtime: 'Controls how Vocalia integrates with SillyTavern group generation and speaker routing.',
     auto_manual: 'Automatically changes the active group reply strategy to Manual while Vocalia is enabled, preventing native random group speaker selection.',
     restore_strategy: 'Restores the group reply strategy Vocalia found before it changed the group to Manual.',
-    use_slash_trigger: 'Uses SillyTavern /trigger as the first method for making a selected group member respond.',
-    fallback_generate: 'Falls back to internal force_chid generation if /trigger is unavailable or fails.',
+    recall_presence: 'When enabled, Vocalia filters prompt history so a character only recalls messages they witnessed while present or remotely connected.',
 
     turn_flow: 'Controls how many group members may participate after one user message and how Vocalia selects first-turn speakers.',
     arrival_mode: 'Controls whether arriving characters become present immediately or after the current automatic response chain ends.',
     first_name_match: 'On the first user message of an empty chat, tries to trigger a present, remote, or locally summoned character by exact or unique name match.',
     first_fallback: 'Controls what Vocalia does on the first message when no character name match or summon is detected.',
-    max_participants: 'Maximum number of assistant participants Vocalia may queue from one parsed routing decision.',
-    max_responses: 'Maximum total automatic assistant responses Vocalia may allow after one user message.',
+    max_participants: 'Maximum number of unique assistant participants allowed after one user message.',
+    max_responses: 'Maximum total assistant responses allowed after one user message.',
+    max_responses_per_participant: 'Maximum number of times one specific character may respond after one user message.',
     response_delay: 'Delay, in seconds, before Vocalia triggers the next queued assistant response.',
 
     refined_display: 'Controls how structured Vocalia messages are rendered as readable roleplay text in the chat UI.',
     render_overlay: 'Displays the raw structured message as a refined readable message without changing the stored chat text.',
+    hide_empty_blocks: 'Hides empty structured block placeholders in refined messages.',
     hide_character_name: 'Hides the active character label in refined messages.',
     hide_thoughts: 'Hides private [thoughts] segments in refined messages.',
     quote_dialogue: 'Wraps dialogue in quotes when displaying refined messages.',
@@ -6430,7 +6708,7 @@ const VOCALIA_LABEL_HELP = Object.freeze({
     status_section: 'Opens scene status diagnostics. Present means physically in-scene. Remote means active phone, radio, video, or text contact. Absent means neither present nor remotely connected.',
     status_popup: 'Shows current scene arrays and lets you manually adjust each group member’s Vocalia status for testing or correction.',
     status_arrays: 'Current Vocalia scene arrays for the active group chat.',
-    status_member_table: 'Lists every active group member, whether their automatic response allowance has been spent this turn, and their current Vocalia status.',
+    status_member_table: 'Lists every participant, whether they are enabled in the group, their response count this turn, and their current Vocalia status.',
     sync_state: 'Rebuilds Vocalia scene state from the active group roster. Useful after changing group members or recovering from mismatched diagnostics.',
 
     debug_popup: 'Collects a focused diagnostic trace. Start logging, reproduce the issue, then copy or download the log.',
@@ -6554,6 +6832,12 @@ function injectStyles() {
             align-items: center;
             flex-wrap: wrap;
             gap: 8px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-inline-unit {
+            opacity: 0.85;
+            margin-left: 0.35em;
+            white-space: nowrap;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-control-with-tip {
@@ -6839,12 +7123,48 @@ function injectStyles() {
             text-transform: lowercase;
         }
 
-        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ASTERISKS}"] {
+        .aspect-vocalia-segment[data-display-style="muted"],
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ASTERISKS}"],
+        .aspect-vocalia-segment[data-display-style="muted_bold"],
+        .aspect-vocalia-segment[data-display-style="muted_underline"],
+        .aspect-vocalia-segment[data-display-style="muted_strike"],
+        .aspect-vocalia-segment[data-display-style="muted_uppercase"],
+        .aspect-vocalia-segment[data-display-style="muted_lowercase"] {
             opacity: 0.88;
+        }
+
+        .aspect-vocalia-segment[data-display-style="muted_bold"] {
+            font-weight: 700;
+        }
+
+        .aspect-vocalia-segment[data-display-style="muted_underline"] {
+            text-decoration: underline;
+        }
+
+        .aspect-vocalia-segment[data-display-style="muted_strike"] {
+            text-decoration: line-through;
+        }
+
+        .aspect-vocalia-segment[data-display-style="muted_uppercase"] {
+            text-transform: uppercase;
+        }
+
+        .aspect-vocalia-segment[data-display-style="muted_lowercase"] {
+            text-transform: lowercase;
         }
 
         .aspect-vocalia-segment-thoughts {
             opacity: 0.92;
+        }
+
+        .aspect-vocalia-segment-thoughts[data-display-style="muted"],
+        .aspect-vocalia-segment-thoughts[data-display-style="${OVERLAY_STYLE_ASTERISKS}"],
+        .aspect-vocalia-segment-thoughts[data-display-style="muted_bold"],
+        .aspect-vocalia-segment-thoughts[data-display-style="muted_underline"],
+        .aspect-vocalia-segment-thoughts[data-display-style="muted_strike"],
+        .aspect-vocalia-segment-thoughts[data-display-style="muted_uppercase"],
+        .aspect-vocalia-segment-thoughts[data-display-style="muted_lowercase"] {
+            opacity: 0.78;
         }
 
         .aspect-vocalia-formatted {
@@ -6973,19 +7293,20 @@ function addVocaliaInfoTipsToSettings() {
     appendVocaliaInfoTip(findVocaliaLabelByText('Runtime'), 'runtime', 'Explain Runtime');
     appendVocaliaInfoTip(findVocaliaLabelByText('Change Group Reply Strategy to Manual Automatically'), 'auto_manual', 'Explain Manual Strategy');
     appendVocaliaInfoTip(findVocaliaLabelByText('Restore Original Group Reply Strategy Automatically'), 'restore_strategy', 'Explain Strategy Restore');
-    appendVocaliaInfoTip(findVocaliaLabelByText('Use silent /trigger first'), 'use_slash_trigger', 'Explain /trigger');
-    appendVocaliaInfoTip(findVocaliaLabelByText('Fallback to internal force_chid generation if /trigger fails'), 'fallback_generate', 'Explain force_chid fallback');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Presence Required for Message Recall'), 'recall_presence', 'Explain Message Recall');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Turn Flow'), 'turn_flow', 'Explain Turn Flow');
-    appendVocaliaInfoTip(findVocaliaLabelByText('Apply first-assistant arriving= array'), 'arrival_mode', 'Explain Arrivals');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Arrival Handling'), 'arrival_mode', 'Explain Arrival Handling');
     appendVocaliaInfoTip(findVocaliaLabelByText('On First Message, Trigger Character by Name Match'), 'first_name_match', 'Explain First Message Name Match');
     appendVocaliaInfoTip(findVocaliaLabelByText('If No Character Match on First Message'), 'first_fallback', 'Explain First Message Fallback');
     appendVocaliaInfoTip(findVocaliaLabelByText('Max Participants Per Turn'), 'max_participants', 'Explain Max Participants');
     appendVocaliaInfoTip(findVocaliaLabelByText('Max Responses Per Turn'), 'max_responses', 'Explain Max Responses');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Max Responses Per Participant Per Turn'), 'max_responses_per_participant', 'Explain Max Responses Per Participant');
     appendVocaliaInfoTip(findVocaliaLabelByText('Delay Between Responses'), 'response_delay', 'Explain Response Delay');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Refined Message Display'), 'refined_display', 'Explain Refined Message Display');
     appendVocaliaInfoTip(findVocaliaLabelByText('Display Raw Message as Refined Message'), 'render_overlay', 'Explain Refined Message');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Hide Empty Block Tags'), 'hide_empty_blocks', 'Explain Empty Block Tags');
     appendVocaliaInfoTip(findVocaliaLabelByText('Hide Character Name in Refined Message'), 'hide_character_name', 'Explain Character Name Display');
     appendVocaliaInfoTip(findVocaliaLabelByText('Hide Thoughts in Refined Message'), 'hide_thoughts', 'Explain Thought Display');
     appendVocaliaInfoTip(findVocaliaLabelByText('Wrap Dialogue in Quotes in Refined Message'), 'quote_dialogue', 'Explain Dialogue Quotes');
@@ -6994,13 +7315,13 @@ function addVocaliaInfoTipsToSettings() {
     appendVocaliaInfoTip(findVocaliaLabelByText('Style for Thoughts'), 'thoughts_style', 'Explain Thought Style');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Protocol'), 'protocol', 'Explain Protocol');
-    appendVocaliaInfoTip(findVocaliaLabelByText('Protocol injection depth'), 'prompt_depth', 'Explain Protocol Depth');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Protocol Injection Depth'), 'prompt_depth', 'Explain Protocol Depth');
     appendVocaliaInfoTip(findVocaliaLabelByText('Hide Debug Toasts'), 'hide_debug_toasts', 'Explain Debug Toasts');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Status', '.aspect-vocalia-section-title'), 'status_section', 'Explain Status');
     appendVocaliaInfoTip(findVocaliaLabelByText('Status', '#aspect_vocalia_status_popup .aspect-vocalia-popup-title'), 'status_popup', 'Explain Status Popup');
     appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_status_popup .aspect-vocalia-status-arrays-label'), 'status_arrays', 'Explain Scene Arrays');
-    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_status_popup .aspect-vocalia-status-members-label'), 'status_member_table', 'Explain Member Status Table');
+    appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_status_popup .aspect-vocalia-status-members-label'), 'status_member_table', 'Explain Status Configuration');
     appendVocaliaInfoTip(document.querySelector('#aspect_vocalia_status_popup .aspect-vocalia-sync-tip-anchor'), 'sync_state', 'Explain Sync Scene State');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Debug Log', '#aspect_vocalia_debug_popup .aspect-vocalia-popup-title'), 'debug_popup', 'Explain Debug Log');
@@ -7387,14 +7708,28 @@ function renderOverlayStyleOptions(selectedStyle) {
 
     const options = [
         [OVERLAY_STYLE_PLAIN, 'None'],
+        ['muted', 'Muted'],
+
         [OVERLAY_STYLE_BOLD, 'Bold'],
+		['muted_bold', 'Muted Bold'],
+		
         [OVERLAY_STYLE_ITALIC, 'Italics'],
+		[OVERLAY_STYLE_ASTERISKS, 'Muted Italics'],
+		
         [OVERLAY_STYLE_BOLD_ITALIC, 'Bold Italics'],
-        [OVERLAY_STYLE_ASTERISKS, 'Muted Italics'],
+        
+
         [OVERLAY_STYLE_UNDERLINE, 'Underline'],
+        ['muted_underline', 'Muted Underline'],
+
         [OVERLAY_STYLE_STRIKE, 'Strike-through'],
+        ['muted_strike', 'Muted Strike-through'],
+
         [OVERLAY_STYLE_UPPERCASE, 'Uppercase'],
+        ['muted_uppercase', 'Muted Uppercase'],
+
         [OVERLAY_STYLE_LOWERCASE, 'Lowercase'],
+        ['muted_lowercase', 'Muted Lowercase'],
     ];
 
     return options.map(([value, label]) => {
@@ -7405,12 +7740,12 @@ function renderOverlayStyleOptions(selectedStyle) {
 
 function renderDiagnosticMemberRows() {
     const members = getGroupMembers();
-    const triggered = getTriggeredThisTurnSet();
+    const limits = getTurnLimitSettings();
 
     if (!members.length) {
         return `
             <tr>
-                <td colspan="3">
+                <td colspan="4">
                     <em>No active group chat detected.</em>
                 </td>
             </tr>`;
@@ -7418,15 +7753,17 @@ function renderDiagnosticMemberRows() {
 
     return members.map(member => {
         const status = getDiagnosticStatusForMember(member);
-        const disabledText = member.disabled ? ' · disabled in group' : '';
-        const allowanceText = triggered.has(member.avatar) ? 'spent' : 'available';
+        const responseCount = getParticipantResponseCount(member);
+        const allowanceText = `${responseCount}/${limits.maxResponsesPerParticipantPerTurn}`;
+        const enabledText = member.disabled ? 'false' : 'true';
 
         return `
             <tr data-avatar="${escapeHtml(member.avatar)}">
                 <td>
                     <div class="aspect-vocalia-member-name">${escapeHtml(member.name)}</div>
-                    <div class="aspect-vocalia-member-avatar">${escapeHtml(member.avatar)}${escapeHtml(disabledText)}</div>
+                    <div class="aspect-vocalia-member-avatar">${escapeHtml(member.avatar)}</div>
                 </td>
+                <td>${escapeHtml(enabledText)}</td>
                 <td>${escapeHtml(allowanceText)}</td>
                 <td>
                     <select class="text_pole aspect_vocalia_member_status_select" data-avatar="${escapeHtml(member.avatar)}">
@@ -7658,13 +7995,8 @@ function injectSettingsUi() {
                             </label>
 
                             <label class="checkbox_label">
-                                <input id="av_use_slash" type="checkbox">
-                                <span class="aspect-vocalia-label-text">Use silent /trigger first</span>
-                            </label>
-
-                            <label class="checkbox_label">
-                                <input id="av_fallback_generate" type="checkbox">
-                                <span class="aspect-vocalia-label-text">Fallback to internal force_chid generation if /trigger fails</span>
+                                <input id="av_occlude_history" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Presence Required for Message Recall</span>
                             </label>
                         </div>
                     </div>
@@ -7673,7 +8005,7 @@ function injectSettingsUi() {
                         <div class="aspect-vocalia-section-title">Turn Flow</div>
 
                         <div class="flex-container flexFlowColumn">
-                            <label for="av_arrival_mode" class="aspect-vocalia-label">Apply first-assistant arriving= array</label>
+                            <label for="av_arrival_mode" class="aspect-vocalia-label">Arrival Handling</label>
                             <select id="av_arrival_mode" class="text_pole">
                                 <option value="${ARRIVAL_APPLY_IMMEDIATE}">Immediately when the first assistant declares it</option>
                                 <option value="${ARRIVAL_APPLY_DEFERRED}">After the current auto-reply chain ends</option>
@@ -7692,18 +8024,26 @@ function injectSettingsUi() {
                             </select>
 
                             <div class="flex-container alignItemsCenter">
-                                <label for="av_max_triggers" class="flexGrow aspect-vocalia-label">Max Participants Per Turn</label>
-                                <input id="av_max_triggers" class="text_pole widthUnset" type="number" min="1" max="10" step="1">
+                                <label for="av_max_participants" class="flexGrow aspect-vocalia-label">Max Participants Per Turn</label>
+                                <input id="av_max_participants" class="text_pole widthUnset" type="number" min="1" max="10" step="1">
                             </div>
 
                             <div class="flex-container alignItemsCenter">
-                                <label for="av_max_chain" class="flexGrow aspect-vocalia-label">Max Responses Per Turn</label>
-                                <input id="av_max_chain" class="text_pole widthUnset" type="number" min="0" max="50" step="1">
+                                <label for="av_max_responses" class="flexGrow aspect-vocalia-label">Max Responses Per Turn</label>
+                                <input id="av_max_responses" class="text_pole widthUnset" type="number" min="0" max="50" step="1">
+                            </div>
+
+                            <div class="flex-container alignItemsCenter">
+                                <label for="av_max_responses_per_participant" class="flexGrow aspect-vocalia-label">Max Responses Per Participant Per Turn</label>
+                                <input id="av_max_responses_per_participant" class="text_pole widthUnset" type="number" min="1" max="3" step="1">
                             </div>
 
                             <div class="flex-container alignItemsCenter">
                                 <label for="av_trigger_delay" class="flexGrow aspect-vocalia-label">Delay Between Responses</label>
-                                <input id="av_trigger_delay" class="text_pole widthUnset" type="number" min="0" max="10" step="0.05">
+                                <span>
+                                    <input id="av_trigger_delay" class="text_pole widthUnset" type="number" min="0" max="10" step="0.05">
+                                    <span class="aspect-vocalia-inline-unit">Seconds</span>
+                                </span>
                             </div>
                         </div>
                     </div>
@@ -7715,6 +8055,11 @@ function injectSettingsUi() {
                             <label class="checkbox_label">
                                 <input id="av_render_overlay" type="checkbox">
                                 <span class="aspect-vocalia-label-text">Display Raw Message as Refined Message</span>
+                            </label>
+
+                            <label class="checkbox_label">
+                                <input id="av_hide_empty_sections" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Hide Empty Block Tags</span>
                             </label>
 
                             <label class="checkbox_label">
@@ -7754,7 +8099,7 @@ function injectSettingsUi() {
 
                         <div class="flex-container flexFlowColumn">
                             <div class="flex-container alignItemsCenter">
-                                <label for="av_prompt_depth" class="flexGrow aspect-vocalia-label">Protocol injection depth</label>
+                                <label for="av_prompt_depth" class="flexGrow aspect-vocalia-label">Protocol Injection Depth</label>
                                 <input id="av_prompt_depth" class="text_pole widthUnset" type="number" min="0" max="100" step="1">
                             </div>
 
@@ -7791,12 +8136,13 @@ function injectSettingsUi() {
                                     <div>Triggered this user turn: <code id="aspect_vocalia_array_triggered">none</code></div>
                                 </div>
 
-                                <div class="aspect-vocalia-label aspect-vocalia-status-members-label">Member status table</div>
+                                <div class="aspect-vocalia-label aspect-vocalia-status-members-label">Status Configuration</div>
                                 <table id="aspect_vocalia_member_state_table">
                                     <thead>
                                         <tr>
-                                            <th>Group member</th>
-                                            <th>Allowance</th>
+                                            <th>Participants</th>
+                                            <th>Enabled</th>
+                                            <th>Responses</th>
                                             <th>Status</th>
                                         </tr>
                                     </thead>
@@ -7851,18 +8197,19 @@ function loadSettingsUi() {
     $('#av_enabled').prop('checked', !!settings.enabled);
     $('#av_auto_manual').prop('checked', !!settings.autoSetManual);
     $('#av_restore_strategy').prop('checked', !!settings.restoreOriginalStrategyOnDisable);
-    $('#av_use_slash').prop('checked', !!settings.useSlashTrigger);
-    $('#av_fallback_generate').prop('checked', !!settings.fallbackToInternalGenerate);
+    $('#av_occlude_history').prop('checked', !!settings.occludeUnwitnessedHistory);
 
     $('#av_arrival_mode').val(settings.arrivalApplyMode);
     $('#av_first_name_match').prop('checked', !!settings.triggerNamedCharacterOnFirstUserMessage);
     $('#av_first_fallback').val(settings.firstMessageFallback);
 
-    $('#av_max_triggers').val(String(settings.maxTriggersPerMessage));
-    $('#av_max_chain').val(String(settings.maxChainReplies));
+    $('#av_max_participants').val(String(settings.maxParticipantsPerTurn));
+    $('#av_max_responses').val(String(settings.maxResponsesPerTurn));
+    $('#av_max_responses_per_participant').val(String(settings.maxResponsesPerParticipantPerTurn));
     $('#av_trigger_delay').val(formatDelaySeconds(settings.triggerDelayMs));
 
     $('#av_render_overlay').prop('checked', !!settings.renderOverlay);
+    $('#av_hide_empty_sections').prop('checked', !!settings.hideEmptySections);
     $('#av_hide_character_name').prop('checked', getRefinedMessageCharacterNameHidden(settings));
     $('#av_hide_thoughts').prop('checked', getRefinedMessageThoughtsHidden(settings));
     $('#av_quote_dialogue').prop('checked', !!settings.quoteDialogue);
@@ -7890,7 +8237,7 @@ function bindSettingsUi() {
 
     const bindNumber = (selector, key, min, max, after = null) => {
         $(selector).on('change input', async function () {
-            const value = Math.min(max, Math.max(min, Number($(this).val()) || 0));
+            const value = Math.min(max, Math.max(min, Math.round(Number($(this).val()) || 0)));
             getSettings()[key] = value;
             $(this).val(String(value));
             saveSettings();
@@ -7934,8 +8281,7 @@ function bindSettingsUi() {
 
     bindCheckbox('#av_auto_manual', 'autoSetManual', async () => forceManualStrategyForCurrentGroup());
     bindCheckbox('#av_restore_strategy', 'restoreOriginalStrategyOnDisable');
-    bindCheckbox('#av_use_slash', 'useSlashTrigger');
-    bindCheckbox('#av_fallback_generate', 'fallbackToInternalGenerate');
+    bindCheckbox('#av_occlude_history', 'occludeUnwitnessedHistory');
 
     bindPlainSelect('#av_arrival_mode', 'arrivalApplyMode', async () => {
         if (getSettings().arrivalApplyMode === ARRIVAL_APPLY_IMMEDIATE) {
@@ -7950,13 +8296,19 @@ function bindSettingsUi() {
     bindCheckbox('#av_first_name_match', 'triggerNamedCharacterOnFirstUserMessage');
     bindPlainSelect('#av_first_fallback', 'firstMessageFallback');
 
-    bindNumber('#av_max_triggers', 'maxTriggersPerMessage', 1, 10);
-    bindNumber('#av_max_chain', 'maxChainReplies', 0, 50);
+    bindNumber('#av_max_participants', 'maxParticipantsPerTurn', 1, 10, async () => updateExtensionPrompt());
+    bindNumber('#av_max_responses', 'maxResponsesPerTurn', 0, 50, async () => updateExtensionPrompt());
+    bindNumber('#av_max_responses_per_participant', 'maxResponsesPerParticipantPerTurn', 1, 3, async () => {
+        updateDiagnosticsPanel();
+        updateExtensionPrompt();
+    });
     bindDelaySeconds('#av_trigger_delay');
 
     bindCheckbox('#av_render_overlay', 'renderOverlay', async () => {
         applyOverlaySettingToVisibleMessages();
     });
+
+    bindCheckbox('#av_hide_empty_sections', 'hideEmptySections', async () => renderAllVisibleOverlays());
 
     $('#av_hide_character_name').on('change', async function () {
         setInvertedBooleanSetting('hideCharacterNameInRefinedMessage', 'showCharacterLabels', !!$(this).prop('checked'));
