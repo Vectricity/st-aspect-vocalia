@@ -191,6 +191,8 @@ let vocaliaActiveGenerationTargetReason = null;
 // - Migrate legacy Group Speaker Router settings/state into Aspect: Vocalia.
 // - Migrate renamed/inverted settings while keeping old internal call sites safe.
 // - Migrate turn limits from old message/chain wording to true per-turn tracking.
+// - Never infer a live turn reset from empty triggeredThisTurn/chainCount;
+//   resets must happen only through explicit reset paths.
 // ============================================================================
 
 function ctx() {
@@ -308,47 +310,51 @@ function migrateRenamedSettings(settings) {
     return settings;
 }
 
-function migrateTurnTrackingState(state) {
-    state.triggeredThisTurn ??= [];
-    state.participantResponseCountsThisTurn ??= {};
+function normalizeParticipantResponseCounts(value) {
+    const source = (
+        value
+        && typeof value === 'object'
+        && !Array.isArray(value)
+    ) ? value : {};
 
-    if (
-        (!state.participantResponseCountsThisTurn || typeof state.participantResponseCountsThisTurn !== 'object' || Array.isArray(state.participantResponseCountsThisTurn))
-    ) {
-        state.participantResponseCountsThisTurn = {};
+    const cleanCounts = {};
+
+    for (const [avatar, count] of Object.entries(source)) {
+        const safeCount = clampInteger(count, 0, 100, 0);
+        if (avatar && safeCount > 0) cleanCounts[avatar] = safeCount;
     }
 
-    // If an older chat-state only had triggeredThisTurn, convert it into counts.
+    return cleanCounts;
+}
+
+function migrateTurnTrackingState(state) {
+    state.triggeredThisTurn ??= [];
+    state.participantResponseCountsThisTurn = normalizeParticipantResponseCounts(state.participantResponseCountsThisTurn);
+
+    // Compatibility migration only:
+    // if an older chat-state had triggeredThisTurn but no count map, convert it.
+    // Do not use empty triggeredThisTurn + chainCount=0 as a reset signal.
+    // Live resets are explicit and happen in resetTurnResponseTracking(),
+    // handleUserMessage(), controlled generation setup, and empty-send setup.
     if (
         Object.keys(state.participantResponseCountsThisTurn).length === 0
         && Array.isArray(state.triggeredThisTurn)
         && state.triggeredThisTurn.length
     ) {
+        const migratedCounts = {};
+
         for (const avatar of state.triggeredThisTurn) {
-            if (avatar) state.participantResponseCountsThisTurn[avatar] = 1;
+            if (avatar) migratedCounts[avatar] = 1;
         }
+
+        state.participantResponseCountsThisTurn = normalizeParticipantResponseCounts(migratedCounts);
     }
 
-    // Existing code paths reset the old array and chainCount at the start of a
-    // user turn. Treat that as an explicit reset for the new count map too.
-    if (
-        Array.isArray(state.triggeredThisTurn)
-        && state.triggeredThisTurn.length === 0
-        && Number(state.chainCount || 0) === 0
-    ) {
-        state.participantResponseCountsThisTurn = {};
-    }
+    state.triggeredThisTurn = Object.keys(state.participantResponseCountsThisTurn);
 
-    const cleanCounts = {};
-    for (const [avatar, count] of Object.entries(state.participantResponseCountsThisTurn ?? {})) {
-        const safeCount = clampInteger(count, 0, 100, 0);
-        if (avatar && safeCount > 0) cleanCounts[avatar] = safeCount;
-    }
+    const totalFromCounts = Object.values(state.participantResponseCountsThisTurn)
+        .reduce((sum, count) => sum + Number(count || 0), 0);
 
-    state.participantResponseCountsThisTurn = cleanCounts;
-    state.triggeredThisTurn = Object.keys(cleanCounts);
-
-    const totalFromCounts = Object.values(cleanCounts).reduce((sum, count) => sum + Number(count || 0), 0);
     if (totalFromCounts > Number(state.chainCount || 0)) {
         state.chainCount = totalFromCounts;
     }
@@ -1578,26 +1584,13 @@ function resolveNamesToMembers(names) {
 }
 
 // ============================================================================
-// Section 6. Opening, Existing-Chat, Empty-Send, User-Summon, and User-Departure Selection
+// Section 6. User-Turn Selection Core Helpers
 // ============================================================================
 // Purpose:
-// - Bootstrap empty chats without router metadata history.
-// - Continue existing chats by selecting the most recent route-eligible prior
-//   assistant speaker when Vocalia lacks a clean current-turn target.
-// - Intercept empty Send continuation so SillyTavern Manual mode cannot choose
-//   a random unmuted group member behind Vocalia's back.
-// - Recover from user-only / unanswered-user-message chats by inspecting the
-//   latest user message when empty Send is pressed.
-// - Allow user-side summons/contact to bring absent members into route eligibility.
-// - Use a constrained local alias-use classifier for absent-character bootstrap:
-//   exact alias + interaction signal = present/remote;
-//   exact alias + reference-only signal = no summon.
-// - Allow user-side scene departure to move present members to absent when the
-//   user clearly changes active scene without taking those members along.
-// - Treat "departing" as a routing state meaning "no longer present in the
-//   active scene", not necessarily literal physical walking away.
-// - Allow multiple explicitly relevant members to trigger in one user turn.
-// - Never resurrect absent members through random/first fallback.
+// - Resolve message IDs and user message text.
+// - Resolve route-eligible, absent, and departure candidate members.
+// - Provide shared regex/category helpers used by user-side transition classifiers.
+// - Keep trigger target limiting tied to Max Participants Per Turn.
 // ============================================================================
 
 function getAssistantMessagesBefore(messageId) {
@@ -1735,613 +1728,49 @@ function getUserSubjectPattern() {
     return `(?:${wordsAlternation(getUserSceneAliases())})`;
 }
 
-function normalizeClassifierToken(value) {
-    return String(value ?? '')
-        .normalize('NFKC')
-        .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')
-        .toLocaleLowerCase();
-}
-
-function tokenizeForAliasClassifier(text) {
-    const source = String(text ?? '');
-    const tokens = [];
-    const pattern = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)?/gu;
-
-    for (const match of source.matchAll(pattern)) {
-        const raw = match[0];
-        const lower = normalizeClassifierToken(raw);
-        if (!lower) continue;
-
-        tokens.push({
-            raw,
-            lower,
-            start: match.index,
-            end: match.index + raw.length,
-        });
-    }
-
-    return tokens;
-}
-
-function classifierTokenSet(values) {
-    return new Set(values.map(normalizeClassifierToken).filter(Boolean));
-}
-
-function tokenInCategory(token, category) {
-    if (!token) return false;
-    return category.has(token.lower);
-}
-
-function anyTokenInCategory(tokens, category) {
-    return tokens.some(token => tokenInCategory(token, category));
-}
-
-function findTokenSubsequence(tokens, searchTokens) {
-    if (!tokens.length || !searchTokens.length || searchTokens.length > tokens.length) return -1;
-
-    const haystack = tokens.map(token => typeof token === 'string' ? token : token.lower);
-    const needle = searchTokens.map(token => typeof token === 'string' ? token : token.lower);
-
-    for (let i = 0; i <= haystack.length - needle.length; i += 1) {
-        let matched = true;
-
-        for (let j = 0; j < needle.length; j += 1) {
-            if (haystack[i + j] !== needle[j]) {
-                matched = false;
-                break;
-            }
-        }
-
-        if (matched) return i;
-    }
-
-    return -1;
-}
-
-function findAliasClassifierSpans(sourceTokens, alias) {
-    const aliasTokens = tokenizeForAliasClassifier(alias);
-    if (!sourceTokens.length || !aliasTokens.length) return [];
-
-    const aliasLowers = aliasTokens.map(token => token.lower);
-    const spans = [];
-
-    for (let i = 0; i <= sourceTokens.length - aliasLowers.length; i += 1) {
-        let matched = true;
-
-        for (let j = 0; j < aliasLowers.length; j += 1) {
-            if (sourceTokens[i + j].lower !== aliasLowers[j]) {
-                matched = false;
-                break;
-            }
-        }
-
-        if (!matched) continue;
-
-        spans.push({
-            alias,
-            aliasTokens: aliasLowers,
-            startIndex: i,
-            endIndex: i + aliasLowers.length,
-            charStart: sourceTokens[i].start,
-            charEnd: sourceTokens[i + aliasLowers.length - 1].end,
-        });
-    }
-
-    return spans;
-}
-
-function tokenWindowAroundSpan(tokens, span, radius = 8) {
-    return tokens.slice(
-        Math.max(0, span.startIndex - radius),
-        Math.min(tokens.length, span.endIndex + radius),
-    );
-}
-
-function tokensBeforeSpan(tokens, span, radius = 8) {
-    return tokens.slice(Math.max(0, span.startIndex - radius), span.startIndex);
-}
-
-function tokensAfterSpan(tokens, span, radius = 8) {
-    return tokens.slice(span.endIndex, Math.min(tokens.length, span.endIndex + radius));
-}
-
-function aliasHasPossessiveMarker(source, span) {
-    return /^['’]s\b/iu.test(String(source ?? '').slice(span.charEnd, span.charEnd + 3));
-}
-
-function getClassifierClauseText(source, span) {
-    const text = String(source ?? '');
-    const before = text.slice(0, span.charStart);
-    const after = text.slice(span.charEnd);
-
-    const leftBoundaries = [
-        before.lastIndexOf('.'),
-        before.lastIndexOf('!'),
-        before.lastIndexOf('?'),
-        before.lastIndexOf('。'),
-        before.lastIndexOf('！'),
-        before.lastIndexOf('？'),
-        before.lastIndexOf('\n'),
-    ];
-
-    const left = Math.max(...leftBoundaries) + 1;
-
-    const rightCandidates = ['.', '!', '?', '。', '！', '？', '\n']
-        .map(boundary => after.indexOf(boundary))
-        .filter(index => index >= 0);
-
-    const right = rightCandidates.length
-        ? span.charEnd + Math.min(...rightCandidates)
-        : text.length;
-
-    return text.slice(left, right).trim();
-}
-
-function getClassifierClauseTokens(source, span) {
-    return tokenizeForAliasClassifier(getClassifierClauseText(source, span));
-}
-
-function getRawTextAfterSpan(source, span, length = 8) {
-    return String(source ?? '').slice(span.charEnd, span.charEnd + length);
-}
-
-function getRawTextBeforeSpan(source, span, length = 8) {
-    return String(source ?? '').slice(Math.max(0, span.charStart - length), span.charStart);
-}
-
-function hasPunctuationAddressMarker(source, span) {
-    const before = getRawTextBeforeSpan(source, span, 4);
-    const after = getRawTextAfterSpan(source, span, 4);
-
-    return (
-        /(?:^|[\s"'“‘([{])$/u.test(before)
-        && /^\s*[,.:;?!！？，。]/u.test(after)
-    );
-}
-
-function aliasStartsOrEndsShortClause(source, span, maxExtraTokens = 3) {
-    const clauseTokens = getClassifierClauseTokens(source, span);
-    if (!clauseTokens.length) return false;
-
-    const aliasTokens = span.aliasTokens;
-    const aliasOffset = findTokenSubsequence(clauseTokens, aliasTokens);
-    if (aliasOffset < 0) return false;
-
-    const extraCount = clauseTokens.length - aliasTokens.length;
-    if (extraCount > maxExtraTokens) return false;
-
-    const atStart = aliasOffset === 0;
-    const atEnd = aliasOffset + aliasTokens.length === clauseTokens.length;
-
-    return atStart || atEnd;
-}
-
-function hasUserSubjectNear(tokens) {
-    const userAliases = getUserSceneAliases()
-        .flatMap(alias => tokenizeForAliasClassifier(alias).map(token => token.lower))
-        .filter(Boolean);
-
-    const userAliasSet = new Set([
-        ...userAliases,
-        'i',
-        'me',
-        'my',
-        'myself',
-        'we',
-        'us',
-        'our',
-    ]);
-
-    return tokens.some(token => userAliasSet.has(token.lower));
-}
-
-function hasReferenceOnlySignal(source, tokens, span) {
-    if (aliasHasPossessiveMarker(source, span)) return true;
-
-    const clauseTokens = getClassifierClauseTokens(source, span);
-    const window = tokenWindowAroundSpan(tokens, span, 7);
-
-    const referenceTerms = classifierTokenSet([
-        'wonder',
-        'wondering',
-        'remember',
-        'remembered',
-        'recall',
-        'recalled',
-        'think',
-        'thinking',
-        'thought',
-        'hope',
-        'hoping',
-        'wish',
-        'wishing',
-        'imagine',
-        'imagined',
-        'dream',
-        'dreamed',
-        'dreamt',
-        'miss',
-        'missed',
-        'heard',
-        'told',
-        'mentioned',
-        'mention',
-        'about',
-        'memory',
-        'memories',
-        'rumor',
-        'rumour',
-        'story',
-        'stories',
-        'name',
-        'notes',
-    ]);
-
-    if (anyTokenInCategory(clauseTokens, referenceTerms)) {
-        return true;
-    }
-
-    return anyTokenInCategory(window, referenceTerms)
-        && !hasPunctuationAddressMarker(source, span)
-        && !aliasStartsOrEndsShortClause(source, span, 2);
-}
-
-function isDirectAddressAliasUse(source, tokens, span) {
-    if (aliasHasPossessiveMarker(source, span)) return false;
-
-    const clauseTokens = getClassifierClauseTokens(source, span);
-    if (!clauseTokens.length) return false;
-
-    const addressFillers = classifierTokenSet([
-        'oh',
-        'ah',
-        'uh',
-        'um',
-        'hey',
-        'hi',
-        'hello',
-        'please',
-        'wait',
-        'yo',
-    ]);
-
-    const aliasOffset = findTokenSubsequence(clauseTokens, span.aliasTokens);
-    if (aliasOffset < 0) return false;
-
-    const before = clauseTokens.slice(0, aliasOffset);
-    const after = clauseTokens.slice(aliasOffset + span.aliasTokens.length);
-
-    const onlyAddressFillersBefore = before.every(token => tokenInCategory(token, addressFillers));
-    const onlyAddressFillersAfter = after.every(token => tokenInCategory(token, addressFillers));
-
-    if (hasPunctuationAddressMarker(source, span) && before.length <= 2 && onlyAddressFillersBefore) {
-        return true;
-    }
-
-    if (aliasStartsOrEndsShortClause(source, span, 3) && onlyAddressFillersBefore && onlyAddressFillersAfter) {
-        return true;
-    }
-
-    const quoteBefore = /["“‘']\s*$/u.test(getRawTextBeforeSpan(source, span, 4));
-    const quoteAfter = /^\s*["”’']/u.test(getRawTextAfterSpan(source, span, 4));
-
-    if ((quoteBefore || quoteAfter) && aliasStartsOrEndsShortClause(source, span, 4)) {
-        return !hasReferenceOnlySignal(source, tokens, span);
-    }
-
-    return false;
-}
-
-function isRemoteAliasUse(source, tokens, span) {
-    if (aliasHasPossessiveMarker(source, span)) return false;
-
-    const window = tokenWindowAroundSpan(tokens, span, 10);
-
-    const remoteChannels = classifierTokenSet([
-        'phone',
-        'radio',
-        'text',
-        'dm',
-        'message',
-        'messages',
-        'call',
-        'calls',
-        'comms',
-        'comm',
-        'video',
-        'facetime',
-        'intercom',
-        'walkie',
-        'transceiver',
-        'wireless',
-    ]);
-
-    const remoteContactActions = classifierTokenSet([
-        'call',
-        'called',
-        'calling',
-        'phone',
-        'phoned',
-        'text',
-        'texted',
-        'message',
-        'messaged',
-        'dm',
-        'radio',
-        'radioed',
-        'hail',
-        'hailed',
-        'signal',
-        'signaled',
-        'signalled',
-        'contact',
-        'contacted',
-        'reach',
-        'reached',
-    ]);
-
-    if (!anyTokenInCategory(window, remoteChannels)) return false;
-    if (hasReferenceOnlySignal(source, tokens, span) && !anyTokenInCategory(window, remoteContactActions)) return false;
-
-    return anyTokenInCategory(window, remoteContactActions)
-        || isDirectAddressAliasUse(source, tokens, span)
-        || hasUserSubjectNear(window);
-}
-
-function isExplicitSummonAliasUse(source, tokens, span) {
-    if (aliasHasPossessiveMarker(source, span)) return false;
-
-    const window = tokenWindowAroundSpan(tokens, span, 9);
-
-    const summonActions = classifierTokenSet([
-        'call',
-        'called',
-        'calling',
-        'shout',
-        'shouted',
-        'shouting',
-        'yell',
-        'yelled',
-        'yelling',
-        'cry',
-        'cried',
-        'holler',
-        'hollered',
-        'summon',
-        'summoned',
-        'summoning',
-        'beckon',
-        'beckoned',
-        'wave',
-        'waved',
-        'gesture',
-        'gestured',
-        'fetch',
-        'fetched',
-        'bring',
-        'brought',
-        'get',
-        'got',
-        'hail',
-        'hailed',
-        'signal',
-        'signaled',
-        'signalled',
-    ]);
-
-    if (!anyTokenInCategory(window, summonActions)) return false;
-    if (hasReferenceOnlySignal(source, tokens, span) && !hasUserSubjectNear(window)) return false;
-
-    return true;
-}
-
-function isPhysicalEncounterOrPerceptionAliasUse(source, tokens, span) {
-    if (aliasHasPossessiveMarker(source, span)) return false;
-
-    const window = tokenWindowAroundSpan(tokens, span, 10);
-    const before = tokensBeforeSpan(tokens, span, 8);
-    const after = tokensAfterSpan(tokens, span, 8);
-
-    const perceptionActions = classifierTokenSet([
-        'see',
-        'saw',
-        'seen',
-        'spot',
-        'spotted',
-        'notice',
-        'noticed',
-        'find',
-        'found',
-        'locate',
-        'located',
-        'discover',
-        'discovered',
-        'meet',
-        'met',
-        'encounter',
-        'encountered',
-    ]);
-
-    const contactActions = classifierTokenSet([
-        'bump',
-        'bumped',
-        'run',
-        'ran',
-        'walk',
-        'walked',
-        'walking',
-        'slam',
-        'slammed',
-        'crash',
-        'crashed',
-        'collide',
-        'collided',
-        'stumble',
-        'stumbled',
-        'trip',
-        'tripped',
-        'step',
-        'stepped',
-    ]);
-
-    const movementActions = classifierTokenSet([
-        'go',
-        'went',
-        'head',
-        'headed',
-        'move',
-        'moved',
-        'walk',
-        'walked',
-        'walking',
-        'run',
-        'ran',
-        'turn',
-        'turned',
-        'round',
-        'rounded',
-        'enter',
-        'entered',
-        'come',
-        'came',
-        'cross',
-        'crossed',
-    ]);
-
-    const contactConnectors = classifierTokenSet([
-        'into',
-        'against',
-        'with',
-        'across',
-        'upon',
-        'toward',
-        'towards',
-        'near',
-        'beside',
-        'by',
-    ]);
-
-    const arrivalStateTerms = classifierTokenSet([
-        'arrive',
-        'arrived',
-        'arrives',
-        'enter',
-        'entered',
-        'enters',
-        'appear',
-        'appeared',
-        'appears',
-        'there',
-        'nearby',
-        'ahead',
-        'beside',
-        'front',
-        'behind',
-    ]);
-
-    if (anyTokenInCategory(before, perceptionActions) && hasUserSubjectNear(window)) {
-        return !hasReferenceOnlySignal(source, tokens, span);
-    }
-
-    if (anyTokenInCategory(window, contactActions) && anyTokenInCategory(window, contactConnectors) && hasUserSubjectNear(window)) {
-        return !hasReferenceOnlySignal(source, tokens, span);
-    }
-
-    if (anyTokenInCategory(before, movementActions) && anyTokenInCategory(before, contactConnectors) && hasUserSubjectNear(window)) {
-        return !hasReferenceOnlySignal(source, tokens, span);
-    }
-
-    if (anyTokenInCategory(after, arrivalStateTerms) || anyTokenInCategory(before, arrivalStateTerms)) {
-        return !hasReferenceOnlySignal(source, tokens, span);
-    }
-
-    return false;
-}
-
-function classifyAbsentAliasUse(text, alias) {
-    const source = String(text ?? '');
-    const tokens = tokenizeForAliasClassifier(source);
-    const spans = findAliasClassifierSpans(tokens, alias);
-
-    if (!spans.length) {
-        return null;
-    }
-
-    const rejected = [];
-
-    for (const span of spans) {
-        if (isRemoteAliasUse(source, tokens, span)) {
-            return {
-                type: MEMBER_STATUS_REMOTE,
-                alias,
-                reason: 'remote_channel_contact',
-                span: {
-                    charStart: span.charStart,
-                    charEnd: span.charEnd,
-                },
-            };
-        }
-
-        if (isDirectAddressAliasUse(source, tokens, span)) {
-            return {
-                type: MEMBER_STATUS_PRESENT,
-                alias,
-                reason: 'direct_name_address',
-                span: {
-                    charStart: span.charStart,
-                    charEnd: span.charEnd,
-                },
-            };
-        }
-
-        if (isPhysicalEncounterOrPerceptionAliasUse(source, tokens, span)) {
-            return {
-                type: MEMBER_STATUS_PRESENT,
-                alias,
-                reason: 'physical_encounter_or_perception',
-                span: {
-                    charStart: span.charStart,
-                    charEnd: span.charEnd,
-                },
-            };
-        }
-
-        if (isExplicitSummonAliasUse(source, tokens, span)) {
-            return {
-                type: MEMBER_STATUS_PRESENT,
-                alias,
-                reason: 'explicit_summon_or_call',
-                span: {
-                    charStart: span.charStart,
-                    charEnd: span.charEnd,
-                },
-            };
-        }
-
-        rejected.push({
-            alias,
-            charStart: span.charStart,
-            charEnd: span.charEnd,
-            reason: hasReferenceOnlySignal(source, tokens, span)
-                ? 'reference_only'
-                : 'alias_without_interaction_signal',
-        });
-    }
-
-    return {
-        type: null,
-        alias,
-        reason: 'no_bootstrap_contact',
-        rejected,
-    };
-}
+// ============================================================================
+// Section 7. User-Side Summon and Departure Detection
+// ============================================================================
+// Purpose:
+// - Detect user-side remote contact or physical summons for absent members.
+// - Detect high-confidence user-side departure / leave-behind transitions.
+// - Keep presence persistent by default unless departure is explicitly proven.
+// - Apply user-side scene-state transitions before routing targets are selected.
+// ============================================================================
 
 function isRemoteContactForAlias(text, alias) {
-    return classifyAbsentAliasUse(text, alias)?.type === MEMBER_STATUS_REMOTE;
+    const escapedAlias = escapeRegex(alias);
+
+    const remoteChannel = '(?:phone|text|dm|message|radio|video\\s*call|facetime|intercom|walkie(?:-talkie)?|contact|call)';
+    const contactVerb = '(?:phone|text|dm|message|radio|video\\s*call|facetime|contact|call|reach|get|hail|signal)';
+
+    const patterns = [
+        new RegExp(`\\b${contactVerb}\\s+(?:for\\s+)?${escapedAlias}\\b`, 'iu'),
+        new RegExp(`\\b${contactVerb}\\s+${escapedAlias}\\s+(?:on|by|via|through)\\s+(?:the\\s+)?${remoteChannel}\\b`, 'iu'),
+        new RegExp(`\\b${escapedAlias}\\s+(?:on|by|via|through)\\s+(?:the\\s+)?${remoteChannel}\\b`, 'iu'),
+    ];
+
+    return matchesAnyPattern(text, patterns);
 }
 
 function isPhysicalSummonForAlias(text, alias) {
-    return classifyAbsentAliasUse(text, alias)?.type === MEMBER_STATUS_PRESENT;
+    const escapedAlias = escapeRegex(alias);
+
+    const summonVerb = '(?:call|shout|yell|cry\\s*out|holler|summon|bring|fetch|request|ask|get|wave|motion|gesture)';
+    const joinImperative = '(?:come\\s+here|come\\s+over|get\\s+over\\s+here|join\\s+(?:me|us)|show\\s+up|step\\s+in|come\\s+in)';
+    const physicalNoticeVerb = '(?:spot|see|notice|find|locate|encounter|run\\s+into)';
+    const arrivalVerb = '(?:arrives|enters|walks\\s+in|steps\\s+in|joins|appears|comes\\s+over|comes\\s+here|shows\\s+up)';
+
+    const patterns = [
+        new RegExp(`\\b${summonVerb}\\s+(?:for\\s+)?${escapedAlias}\\b`, 'iu'),
+        new RegExp(`\\b${escapedAlias}\\s*,?\\s*${joinImperative}\\b`, 'iu'),
+        new RegExp(`\\b${joinImperative}\\s*,?\\s*${escapedAlias}\\b`, 'iu'),
+        new RegExp(`\\b${physicalNoticeVerb}\\s+${escapedAlias}\\b`, 'iu'),
+        new RegExp(`\\b${escapedAlias}\\s+${arrivalVerb}\\b`, 'iu'),
+        new RegExp(`(^|[\\s"'“‘])${escapedAlias}[!！](?:\\s|$)`, 'iu'),
+    ];
+
+    return matchesAnyPattern(text, patterns);
 }
 
 function isExplicitLeaveBehindForAlias(text, alias) {
@@ -2374,7 +1803,24 @@ function secondPersonWaitsBehind(text) {
     return matchesAnyPattern(text, patterns);
 }
 
+function isGroupInclusiveMovement(text) {
+    const groupSubject = '(?:we|we\\s+all|all\\s+of\\s+us|the\\s+group|everyone|everybody|the\\s+others|you\\s+all|both\\s+of\\s+you|all\\s+of\\s+you)';
+    const movementVerb = buildMovementVerbPattern();
+    const togetherness = '(?:together|as\\s+a\\s+group|with\\s+me|with\\s+us|alongside|behind\\s+me|after\\s+me|following\\s+me|coming\\s+with)';
+
+    const patterns = [
+        new RegExp(`\\b${groupSubject}\\s+(?:${movementVerb})\\b`, 'iu'),
+        new RegExp(`\\b${groupSubject}\\b[\\s\\S]{0,120}\\b${togetherness}\\b`, 'iu'),
+        new RegExp(`\\b${togetherness}\\b`, 'iu'),
+    ];
+
+    return matchesAnyPattern(text, patterns);
+}
+
 function buildMovementVerbPattern() {
+    // Semantic category: singular-user movement, relocation, searching, or scene-exit action.
+    // This is not a one-off phrase list; these are the action families that imply the
+    // user's active scene may be changing.
     const movementVerbs = [
         'go',
         'head',
@@ -2418,6 +1864,8 @@ function buildMovementVerbPattern() {
 }
 
 function buildSceneTransitionMarkerPattern() {
+    // Semantic category: markers that the user is moving into/through/across/out of
+    // a distinct active-space relation, rather than merely adjusting posture in place.
     const markers = [
         'to',
         'toward',
@@ -2448,20 +1896,6 @@ function buildSceneTransitionMarkerPattern() {
     return wordsAlternation(markers);
 }
 
-function isGroupInclusiveMovement(text) {
-    const groupSubject = '(?:we|we\\s+all|all\\s+of\\s+us|the\\s+group|everyone|everybody|the\\s+others|you\\s+all|both\\s+of\\s+you|all\\s+of\\s+you)';
-    const movementVerb = buildMovementVerbPattern();
-    const togetherness = '(?:together|as\\s+a\\s+group|with\\s+me|with\\s+us|alongside|behind\\s+me|after\\s+me|following\\s+me|coming\\s+with)';
-
-    const patterns = [
-        new RegExp(`\\b${groupSubject}\\s+(?:${movementVerb})\\b`, 'iu'),
-        new RegExp(`\\b${groupSubject}\\b[\\s\\S]{0,120}\\b${togetherness}\\b`, 'iu'),
-        new RegExp(`\\b${togetherness}\\b`, 'iu'),
-    ];
-
-    return matchesAnyPattern(text, patterns);
-}
-
 function userHasSingularMovementClause(text) {
     const source = String(text ?? '');
     const userSubject = getUserSubjectPattern();
@@ -2469,9 +1903,17 @@ function userHasSingularMovementClause(text) {
     const transitionMarker = buildSceneTransitionMarkerPattern();
 
     const patterns = [
+        // "I walk into...", "Neo heads through...", "I turn and walk away..."
         new RegExp(`\\b${userSubject}\\b[\\s\\S]{0,180}\\b(?:${movementVerb})\\b[\\s\\S]{0,140}\\b(?:${transitionMarker})\\b`, 'iu'),
+
+        // Continued same-subject movement after an initial first-person clause:
+        // "I turn around, then move into..."
         new RegExp(`\\b${userSubject}\\b[\\s\\S]{0,80}\\b(?:then|and|before|after|as)\\b[\\s\\S]{0,120}\\b(?:${movementVerb})\\b[\\s\\S]{0,140}\\b(?:${transitionMarker})\\b`, 'iu'),
+
+        // Strong scene-exit verbs need less spatial marking.
         new RegExp(`\\b${userSubject}\\b[\\s\\S]{0,120}\\b(?:leave|depart|exit|disappear|vanish)\\b`, 'iu'),
+
+        // "off I go", "away I walk", etc.
         new RegExp(`\\b(?:away|off|ahead|forward)\\b[\\s\\S]{0,80}\\b${userSubject}\\b[\\s\\S]{0,80}\\b(?:${movementVerb})\\b`, 'iu'),
     ];
 
@@ -2517,11 +1959,38 @@ function getMembersAccompanyingUser(text, candidates) {
     return uniqueMembers(accompanying);
 }
 
+function userExplicitlyMovesAloneAwayFromPresentMembers(text) {
+    const source = String(text ?? '');
+    const userSubject = getUserSubjectPattern();
+    const movementVerb = buildMovementVerbPattern();
+    const transitionMarker = buildSceneTransitionMarkerPattern();
+
+    const soloMarker = '(?:alone|by\\s+myself|on\\s+my\\s+own|by\\s+my\\s+lonesome|without\\s+(?:them|anyone|the\\s+others|everyone|everybody|you|you\\s+all|both\\s+of\\s+you|all\\s+of\\s+you))';
+    const leaveBehindObject = '(?:them|the\\s+others|everyone|everybody|you|you\\s+all|both\\s+of\\s+you|all\\s+of\\s+you)';
+    const leaveBehindPlace = '(?:behind|here|there|at\\s+(?:this|that|the)\\s+place|where\\s+(?:they|you)\\s+(?:are|were))';
+
+    const patterns = [
+        new RegExp(`\\b${userSubject}\\b[\\s\\S]{0,160}\\b(?:${movementVerb})\\b[\\s\\S]{0,120}\\b(?:${transitionMarker})\\b[\\s\\S]{0,80}\\b${soloMarker}\\b`, 'iu'),
+        new RegExp(`\\b${userSubject}\\b[\\s\\S]{0,120}\\b${soloMarker}\\b[\\s\\S]{0,160}\\b(?:${movementVerb})\\b`, 'iu'),
+        new RegExp(`\\b${userSubject}\\b[\\s\\S]{0,180}\\b(?:leave|leaving|left)\\s+${leaveBehindObject}\\s+${leaveBehindPlace}\\b`, 'iu'),
+        new RegExp(`\\b${userSubject}\\b[\\s\\S]{0,180}\\b(?:${movementVerb})\\b[\\s\\S]{0,160}\\b(?:leaving|left)\\s+${leaveBehindObject}\\s+${leaveBehindPlace}\\b`, 'iu'),
+    ];
+
+    return matchesAnyPattern(source, patterns);
+}
+
 function userClearlyLeavesCurrentPlaceAlone(text, candidates = getPresentDepartureCandidates()) {
     const source = String(text ?? '');
 
+    // Presence persists by default. A generic movement clause such as
+    // "I run forward", "I round the corner", or "I charge her" is not enough
+    // to remove present characters from the active scene. This helper only
+    // returns true when the user explicitly marks movement as alone, without
+    // the others, or leaving them behind.
+    if (!candidates.length) return false;
     if (!userHasSingularMovementClause(source)) return false;
     if (isGroupInclusiveMovement(source)) return false;
+    if (!userExplicitlyMovesAloneAwayFromPresentMembers(source)) return false;
 
     const accompanying = getMembersAccompanyingUser(source, candidates);
     return accompanying.length < candidates.length;
@@ -2535,6 +2004,9 @@ function detectUserDepartureBootstrap(text) {
 
     const aliasEntries = buildMentionAliasEntries(candidates);
 
+    // Presence persists unless there is positive leave-behind evidence.
+    // Do not try to prove that present characters are still with the user;
+    // instead, prove that they became absent.
     for (const entry of aliasEntries) {
         if (isExplicitLeaveBehindForAlias(source, entry.alias)) {
             departed.push(entry.member);
@@ -2589,9 +2061,18 @@ function detectUserDepartureBootstrap(text) {
                 type: MEMBER_STATUS_DEPARTING,
                 member: memberDebugSummary(member),
                 alias: member.name,
-                reason: 'user_changed_active_scene_alone_member_left_behind',
+                reason: 'explicit_user_left_active_scene_alone_member_left_behind',
             });
         }
+    }
+
+    if (!departed.length) {
+        evidence.push({
+            type: MEMBER_STATUS_PRESENT,
+            reason: userHasSingularMovementClause(source)
+                ? 'presence_persists_generic_user_movement_not_departure'
+                : 'presence_persists_no_departure_signal',
+        });
     }
 
     return {
@@ -2650,65 +2131,30 @@ function detectUserSummonBootstrap(text) {
     const physical = [];
     const remote = [];
     const evidence = [];
-    const rejected = [];
-
-    const remoteAvatars = new Set();
-    const physicalAvatars = new Set();
 
     for (const entry of aliasEntries) {
         const member = entry.member;
         const alias = entry.alias;
-        const classification = classifyAbsentAliasUse(source, alias);
 
-        if (!classification) continue;
-
-        if (classification.type === MEMBER_STATUS_REMOTE) {
-            if (!remoteAvatars.has(member.avatar)) {
-                remote.push(member);
-                remoteAvatars.add(member.avatar);
-            }
-
+        if (isRemoteContactForAlias(source, alias)) {
+            remote.push(member);
             evidence.push({
                 type: MEMBER_STATUS_REMOTE,
                 member: memberDebugSummary(member),
                 alias,
-                reason: classification.reason,
-                classifier: classification,
             });
             continue;
         }
 
-        if (classification.type === MEMBER_STATUS_PRESENT) {
-            if (!remoteAvatars.has(member.avatar) && !physicalAvatars.has(member.avatar)) {
-                physical.push(member);
-                physicalAvatars.add(member.avatar);
-            }
-
+        if (isPhysicalSummonForAlias(source, alias)) {
+            physical.push(member);
             evidence.push({
                 type: MEMBER_STATUS_PRESENT,
                 member: memberDebugSummary(member),
                 alias,
-                reason: classification.reason,
-                classifier: classification,
-            });
-            continue;
-        }
-
-        if (classification.rejected?.length) {
-            rejected.push({
-                member: memberDebugSummary(member),
-                alias,
-                rejected: classification.rejected,
             });
         }
     }
-
-    logVocaliaEvent('user_summon.classifier', {
-        source,
-        candidates: candidates.map(memberDebugSummary),
-        evidence,
-        rejected,
-    });
 
     return {
         physical: uniqueMembers(physical),
@@ -2746,6 +2192,16 @@ function applyUserSummonBootstrap(userMessageId, userText) {
 
     return detection.targets;
 }
+
+// ============================================================================
+// Section 8. Opening, Existing-Chat, and Empty-Send Target Selection
+// ============================================================================
+// Purpose:
+// - Continue existing chats through prior eligible assistant speakers.
+// - Reuse stored speakingTo targets from the last speaker when appropriate.
+// - Select empty-send continuation targets without native random group routing.
+// - Bootstrap opening user messages with explicit name matches, summons, or fallback.
+// ============================================================================
 
 function findMostRecentRouteEligibleAssistantBefore(messageId) {
     const assistantMessages = getAssistantMessagesBefore(messageId).reverse();
@@ -2831,98 +2287,6 @@ function getCurrentChatTailMessageId() {
     return Math.max(0, (ctx().chat?.length ?? 1));
 }
 
-function getLatestUnansweredUserMessage() {
-    const chat = ctx().chat ?? [];
-
-    for (let i = chat.length - 1; i >= 0; i--) {
-        const message = chat[i];
-        if (!message) continue;
-        if (message.is_system) continue;
-
-        if (message.is_user) {
-            return {
-                messageId: i,
-                message,
-                text: String(message.mes ?? ''),
-            };
-        }
-
-        return null;
-    }
-
-    return null;
-}
-
-function selectTargetsForLatestUnansweredUserMessageRecovery() {
-    const latest = getLatestUnansweredUserMessage();
-
-    if (!latest) {
-        return {
-            hasLatestUserMessage: false,
-            reason: 'empty-send-no-latest-unanswered-user-message',
-            targets: [],
-            sourceMessageId: Math.max(0, (ctx().chat?.length ?? 1) - 1),
-        };
-    }
-
-    const state = ensureStateForCurrentGroup();
-    state.lastUserMessageId = latest.messageId;
-    state.assistantCountSinceUser = 0;
-
-    logVocaliaEvent('empty_send.latest_user_recovery.start', {
-        latestUserMessageId: latest.messageId,
-        latestUserMessage: getMessageDebugSummary(latest.messageId),
-    });
-
-    applyUserDepartureBootstrap(latest.messageId, latest.text);
-
-    awaitManualStateRefreshForRecovery();
-
-    const assistantMessagesBefore = getAssistantMessagesBefore(latest.messageId);
-    const isOpeningUserMessage = assistantMessagesBefore.length === 0;
-
-    if (isOpeningUserMessage) {
-        const openingTargets = selectFirstSpeakerForOpeningUserMessage(latest.messageId);
-
-        logVocaliaEvent('empty_send.latest_user_recovery.opening_targets', {
-            latestUserMessageId: latest.messageId,
-            openingTargets: openingTargets.map(memberDebugSummary),
-        });
-
-        return {
-            hasLatestUserMessage: true,
-            reason: openingTargets.length
-                ? 'empty-send-latest-user-opening-message'
-                : 'empty-send-latest-user-opening-message-no-target',
-            targets: openingTargets,
-            sourceMessageId: latest.messageId,
-        };
-    }
-
-    const continuation = selectContinuationTargetsForUserMessage(latest.messageId, state);
-
-    logVocaliaEvent('empty_send.latest_user_recovery.continuation_targets', {
-        latestUserMessageId: latest.messageId,
-        reason: continuation.reason,
-        targets: continuation.targets.map(memberDebugSummary),
-    });
-
-    return {
-        hasLatestUserMessage: true,
-        reason: continuation.targets.length
-            ? `empty-send-latest-user-${continuation.reason}`
-            : 'empty-send-latest-user-no-continuation-target',
-        targets: continuation.targets,
-        sourceMessageId: latest.messageId,
-    };
-}
-
-function awaitManualStateRefreshForRecovery() {
-    ensureStateForCurrentGroup();
-    updateExtensionPrompt();
-    updateDiagnosticsPanel();
-}
-
 function selectTargetsForEmptySendContinuation() {
     const settings = getSettings();
     const state = ensureStateForCurrentGroup();
@@ -2939,18 +2303,6 @@ function selectTargetsForEmptySendContinuation() {
         },
     });
 
-    const latestUserRecovery = selectTargetsForLatestUnansweredUserMessageRecovery();
-
-    if (latestUserRecovery.hasLatestUserMessage) {
-        logVocaliaEvent('empty_send.select.latest_user_recovery_result', {
-            reason: latestUserRecovery.reason,
-            sourceMessageId: latestUserRecovery.sourceMessageId,
-            targets: latestUserRecovery.targets.map(memberDebugSummary),
-        });
-
-        return latestUserRecovery;
-    }
-
     const storedTargets = limitTriggerTargets(getStoredSpeakingToTargetsFromLastSpeaker());
     if (storedTargets.length) {
         logVocaliaEvent('empty_send.select.result', {
@@ -2961,7 +2313,6 @@ function selectTargetsForEmptySendContinuation() {
         return {
             reason: 'empty-send-stored-speaking-to-targets',
             targets: storedTargets,
-            sourceMessageId: Math.max(0, (ctx().chat?.length ?? 1) - 1),
         };
     }
 
@@ -2978,7 +2329,6 @@ function selectTargetsForEmptySendContinuation() {
             return {
                 reason: 'empty-send-waiting-for-user',
                 targets: [waitingMember],
-                sourceMessageId: Math.max(0, (ctx().chat?.length ?? 1) - 1),
             };
         }
     }
@@ -2988,7 +2338,6 @@ function selectTargetsForEmptySendContinuation() {
         return {
             reason: 'empty-send-most-recent-route-eligible-prior-assistant',
             targets: [priorAssistant.member],
-            sourceMessageId: priorAssistant.messageId,
         };
     }
 
@@ -3005,7 +2354,6 @@ function selectTargetsForEmptySendContinuation() {
             return {
                 reason: 'empty-send-last-route-eligible-speaker',
                 targets: [lastSpeaker],
-                sourceMessageId: Math.max(0, (ctx().chat?.length ?? 1) - 1),
             };
         }
     }
@@ -3016,7 +2364,6 @@ function selectTargetsForEmptySendContinuation() {
         return {
             reason: 'empty-send-sole-route-eligible-member',
             targets: [eligibleMembers[0]],
-            sourceMessageId: Math.max(0, (ctx().chat?.length ?? 1) - 1),
         };
     }
 
@@ -3025,7 +2372,6 @@ function selectTargetsForEmptySendContinuation() {
         return {
             reason: 'empty-send-random-route-eligible-fallback',
             targets: randomMember ? [randomMember] : [],
-            sourceMessageId: Math.max(0, (ctx().chat?.length ?? 1) - 1),
         };
     }
 
@@ -3033,14 +2379,12 @@ function selectTargetsForEmptySendContinuation() {
         return {
             reason: 'empty-send-first-route-eligible-fallback',
             targets: eligibleMembers.slice(0, 1),
-            sourceMessageId: Math.max(0, (ctx().chat?.length ?? 1) - 1),
         };
     }
 
     return {
         reason: 'empty-send-no-continuation-target',
         targets: [],
-        sourceMessageId: Math.max(0, (ctx().chat?.length ?? 1) - 1),
     };
 }
 
@@ -3092,7 +2436,7 @@ function selectFirstSpeakerForOpeningUserMessage(userMessageId) {
 }
 
 // ============================================================================
-// Section 7. Group Reply Strategy Management
+// Section 9. Group Reply Strategy Management
 // ============================================================================
 // Purpose:
 // - Force Manual group mode while the router is enabled.
@@ -3161,22 +2505,206 @@ async function restoreOriginalStrategyForCurrentGroup() {
 }
 
 // ============================================================================
-// Section 8. Router Protocol Prompt Injection
+// Section 10. Router Protocol Prompt Injection
 // ============================================================================
 // Purpose:
+// - Build the Vocalia protocol prompt from editable, labeled instruction fields.
+// - Keep injected text concise because prompt tokens are expensive.
 // - Instruct the active group member to output one canonical structured block.
-// - Allow ordered semantic content segments: dialogue, actions, narration, thoughts.
-// - Keep physical arrivals separate from remote participation.
 // - Make routing metadata strict: exactly one parameters segment, no duplicate keys.
-// - Make the LLM responsible for deciding whether purposeful arrivals speak.
-// - Support multiple next speakers when more than one response makes sense.
-// - Prevent raw semantic segments from using Markdown/SillyTavern display wrappers.
+// - Require [parameters] to be inside the active character block.
+// - Prevent raw segment text from using Markdown/SillyTavern styling wrappers.
+// - Make inner segment closer matching explicit without spending tokens on examples.
 // ============================================================================
 
-function buildInstructionPrompt() {
-    const group = getCurrentGroup();
-    if (!group) return '';
+const VOCALIA_PROTOCOL_SECTION_DEFINITIONS = Object.freeze([
+    {
+        key: 'header',
+        label: 'Protocol Header',
+        rows: 2,
+        defaultText: '[Vocalia Protocol]',
+    },
+    {
+        key: 'scene_state',
+        label: 'Scene State Context',
+        rows: 6,
+        defaultText: [
+            'Members: {{allMembers}}',
+            'Present: {{presentMembers}}',
+            '{{remoteMembersLine}}',
+            '{{absentMembersLine}}',
+            'Pending arrivals: {{pendingArrivals}}',
+        ].join('\n'),
+    },
+    {
+        key: 'active_speaker',
+        label: 'Active Speaker Rules',
+        rows: 5,
+        defaultText: [
+            'Generate as one active group member only.',
+            'Output exactly one [{{tagPrefix}}1=Exact Active Speaker Name] block and no text outside it.',
+            'The active speaker must be present or remote unless just summoned/contacted by the user.',
+            'Never generate as an absent, unreachable character.',
+        ].join('\n'),
+    },
+    {
+        key: 'outer_wrapper',
+        label: 'Outer Character Wrapper Rules',
+        rows: 6,
+        defaultText: [
+            'Required full message shape:',
+            '[{{tagPrefix}}1=Exact Active Speaker Name]',
+            '[dialogue/actions/narration/thoughts as needed]',
+            '[parameters]...[end parameters]',
+            '[end {{tagPrefix}}1]',
+            'The [parameters] segment must be inside this same character block.',
+        ].join('\n'),
+    },
+    {
+        key: 'segment_rules',
+        label: 'Semantic Segment Rules',
+        rows: 10,
+        defaultText: [
+            'Use only these semantic segments, in any order, as needed:',
+            '[dialogue]spoken words only[end dialogue]',
+            '[actions]active speaker physical action/expression/gesture only[end actions]',
+            '[narration]scene/environment/consequences not performed by the active speaker[end narration]',
+            '[thoughts]active speaker private thought only[end thoughts]',
+            '',
+            'Every segment closer must match its opener exactly.',
+            'Use one closer style only: [end tag]. Never write [/end tag].',
+            'Do not put actions, narration, or thoughts inside dialogue.',
+            'Do not wrap segment text in *, **, ***, _, ~, or other style markers.',
+            'Segment tags define meaning; Vocalia styles the refined display later.',
+        ].join('\n'),
+    },
+    {
+        key: 'parameter_schema',
+        label: 'Parameter Segment Schema',
+        rows: 5,
+        defaultText: [
+            'End the character block with exactly one [parameters] segment immediately before [end {{tagPrefix}}1]:',
+            '{{parameterSchema}}',
+        ].join('\n'),
+    },
+    {
+        key: 'arrival_rules',
+        label: 'Arrival Rules',
+        rows: 6,
+        defaultText: [
+            'Arrival rules:',
+            '- Use arriving=ExactName when an absent member physically enters, appears, is encountered, is nearby and expected to join, or is called/summoned into the scene.',
+            '- A purposeful arrival may speak next when scene logic supports it: speakingTo=ExactName, participationNextTurn=speak.',
+            '- If the arrival should not speak yet: arriving=ExactName with participationNextTurn=idle.',
+        ].join('\n'),
+    },
+    {
+        key: 'remote_rules',
+        label: 'Remote Participation Rules',
+        rows: 6,
+        defaultText: [
+            'Remote rules:',
+            '- Use remote=ExactName when an absent member becomes actively reachable by phone, radio, video, intercom, text/DM, or similar channel.',
+            '- Remote members are not physically present but may speak if speakingTo names them and participationNextTurn=speak.',
+            '- Do not use remote for mere mentions, memories, or speculation.',
+        ].join('\n'),
+        remoteOnly: true,
+    },
+    {
+        key: 'multi_speaker_rules',
+        label: 'Multi-Speaker Routing Rules',
+        rows: 6,
+        defaultText: [
+            'Multi-speaker routing:',
+            '- If multiple members should answer this user turn, set speakingTo=ExactName|ExactName and participationNextTurn=speak.',
+            '- Name order is trigger order.',
+            '- Do not exceed {{maxParticipants}} unique participants, {{maxResponses}} total responses, or {{maxPerParticipant}} response(s) per participant this user turn.',
+        ].join('\n'),
+    },
+    {
+        key: 'parameter_behavior',
+        label: 'Parameter Behavior Rules',
+        rows: 10,
+        defaultText: [
+            'Parameter rules:',
+            '- speakingTo=ExactName|user|none. Use exact group member names; never use user for a group member.',
+            '- participationNextTurn=speak lets Vocalia trigger the named eligible member(s).',
+            '- participationNextTurn=idle means stop assistant chaining unless later user input needs a response.',
+            '- participationNextTurn=departing means the active speaker leaves and becomes absent.',
+            '- arriving=ExactName|none only for physical scene entry/encounter/summon.',
+            '- remote=ExactName|none only for active remote contact.',
+            '- Do not invent names. Do not use departing=.',
+            '- When no more assistant response is needed, wait for the user.',
+        ].join('\n'),
+    },
+    {
+        key: 'strictness',
+        label: 'Strictness Reminder',
+        rows: 4,
+        defaultText: 'Routing depends on exact syntax: one valid character wrapper, matching segment end tags, one parameters segment inside the character block, required keys, no duplicate parameters, exact names, [end tag] closers only, and unwrapped semantic text.',
+        strictOnly: true,
+    },
+    {
+        key: 'footer',
+        label: 'Protocol Footer',
+        rows: 2,
+        defaultText: '[End Vocalia Protocol]',
+    },
+]);
 
+function getProtocolInstructionSectionDefinitions() {
+    return VOCALIA_PROTOCOL_SECTION_DEFINITIONS.map(definition => ({ ...definition }));
+}
+
+function getProtocolInstructionDefaultText(key) {
+    return VOCALIA_PROTOCOL_SECTION_DEFINITIONS.find(definition => definition.key === key)?.defaultText ?? '';
+}
+
+function getProtocolInstructionOverrides(settings = getSettings()) {
+    if (!settings.protocolInjectionOverrides || typeof settings.protocolInjectionOverrides !== 'object' || Array.isArray(settings.protocolInjectionOverrides)) {
+        settings.protocolInjectionOverrides = {};
+    }
+
+    return settings.protocolInjectionOverrides;
+}
+
+function getProtocolInstructionTemplate(key, settings = getSettings()) {
+    const overrides = getProtocolInstructionOverrides(settings);
+    const value = overrides[key];
+
+    if (typeof value === 'string') return value;
+    return getProtocolInstructionDefaultText(key);
+}
+
+function setProtocolInstructionTemplate(key, value) {
+    const settings = getSettings();
+    const overrides = getProtocolInstructionOverrides(settings);
+    const defaultText = getProtocolInstructionDefaultText(key);
+    const nextValue = String(value ?? '');
+
+    if (nextValue === defaultText) {
+        delete overrides[key];
+    } else {
+        overrides[key] = nextValue;
+    }
+
+    saveSettings();
+    updateExtensionPrompt();
+}
+
+function resetProtocolInstructionTemplate(key) {
+    const settings = getSettings();
+    const overrides = getProtocolInstructionOverrides(settings);
+
+    delete overrides[key];
+    saveSettings();
+    updateExtensionPrompt();
+
+    return getProtocolInstructionDefaultText(key);
+}
+
+function buildProtocolTemplateValues() {
+    const group = getCurrentGroup();
     const settings = getSettings();
     const tagPrefix = settings.blockTagPrefix || 'character';
     const members = getGroupMembers(group);
@@ -3193,85 +2721,58 @@ function buildInstructionPrompt() {
     const maxResponses = Math.max(0, Number(settings.maxResponsesPerTurn) || 0);
     const maxPerParticipant = Math.max(1, Number(settings.maxResponsesPerParticipantPerTurn) || 1);
 
-    return [
-        '[Aspect: Vocalia Group Speaker Router Protocol - mandatory]',
-        `All group members: ${members.map(member => member.name).join(', ') || 'none'}`,
-        `Physically PRESENT in scene: ${present.map(member => member.name).join(', ') || 'none'}`,
-        hasRemoteSupport ? `REMOTE but actively reachable in scene: ${remote.map(member => member.name).join(', ') || 'none'}` : '',
-        hasRemoteSupport
-            ? `ABSENT from scene and not remotely connected: ${absent.map(member => member.name).join(', ') || 'none'}`
-            : `ABSENT from scene: ${absent.map(member => member.name).join(', ') || 'none'}`,
-        `Pending physical arrivals already declared: ${pendingNames}`,
-        '',
-        'You are generating as exactly one active group member. Output exactly one character block for the active speaker only.',
-        'The active speaker must be physically PRESENT or REMOTE unless the user has just explicitly summoned/contacted them into the scene.',
-        'Do not generate as an absent, non-remote character who has not been summoned/contacted.',
-        'Never output blocks for multiple characters. Never place unwrapped prose before or after the block.',
-        `The outer wrapper MUST be [${tagPrefix}1=Exact Active Speaker Name] and [end ${tagPrefix}1].`,
-        'Wrong outer wrapper: [Mikasa Ackerman] ... [end Mikasa Ackerman]',
-        `Correct outer wrapper: [${tagPrefix}1=Mikasa Ackerman] ... [end ${tagPrefix}1]`,
-        '',
-        'Inside the character block, compose the visible message from ordered semantic segments.',
-        'Segment tags are semantic containers only. They are not style instructions.',
-        'Do not use Markdown or SillyTavern formatting wrappers inside segment content.',
-        'Never wrap [actions], [narration], or [thoughts] content in *asterisks*, **bold markers**, ***bold italic markers***, underscores, tildes, or other visual-formatting syntax.',
-        'Vocalia applies visual styling later in the Refined Message renderer.',
-        '',
-        'You may use these visible-content segment tags multiple times and in any order:',
-        '[dialogue]spoken words only; no actions, no narration, no thoughts[end dialogue]',
-        '[actions]only the active speaker’s deliberate physical action, body movement, facial expression, posture, gesture, voice action, or object interaction[end actions]',
-        '[narration]only non-speaker-specific scene description, environment, atmosphere, timing, crowd reaction, consequences, or details not physically performed by the active speaker[end narration]',
-        '[thoughts]private/internal thought of the active speaker only[end thoughts]',
-        '',
-        'Raw segment formatting examples:',
-        'Wrong: [actions]*She tightens her grip and steps forward.*[end actions]',
-        'Correct: [actions]She tightens her grip and steps forward.[end actions]',
-        'Wrong: [narration]*The corridor falls silent.*[end narration]',
-        'Correct: [narration]The corridor falls silent.[end narration]',
-        'Wrong: [thoughts]*I need to be careful.*[end thoughts]',
-        'Correct: [thoughts]I need to be careful.[end thoughts]',
-        '',
-        'End every character block with exactly one parameters segment.',
-        hasRemoteSupport
-            ? '[parameters]speakingTo=ExactName|user|none, participationNextTurn=speak|idle|departing, arriving=ExactName|none, remote=ExactName|none[end parameters]'
-            : '[parameters]speakingTo=ExactName|user|none, participationNextTurn=speak|idle|departing, arriving=ExactName|none[end parameters]',
-        '',
-        'Arrival rules:',
-        '- arriving=ExactName means an absent group member physically enters, appears, is reached in the same physical scene, or is established as arriving into the active scene.',
-        '- If an absent group member is called, summoned, physically noticed, encountered, or established as nearby and expected to join, include them in arriving=ExactName.',
-        '- A purposeful arrival may speak when it makes scene sense. If that arriving character should speak next, set speakingTo=ExactName and participationNextTurn=speak.',
-        '- If the arriving character deliberately enters silently, stays in the background, watches, listens, or should not speak yet, use arriving=ExactName with participationNextTurn=idle and speakingTo=user|none as appropriate.',
-        '',
-        hasRemoteSupport ? 'Remote participation rules:' : '',
-        hasRemoteSupport ? '- remote=ExactName means an absent group member becomes actively reachable through phone, radio, video call, intercom, text/DM, or another remote communication channel.' : '',
-        hasRemoteSupport ? '- Use remote=ExactName when the active speaker initiates, answers, establishes, or continues a remote communication channel with that group member.' : '',
-        hasRemoteSupport ? '- Remote group members are not physically present, but they may be valid next speakers if speakingTo names them and participationNextTurn=speak.' : '',
-        hasRemoteSupport ? '- If a remote character should speak next, set speakingTo=ExactName and participationNextTurn=speak.' : '',
-        hasRemoteSupport ? '- Do not use remote for a mere mention, memory, or speculation.' : '',
-        '',
-        'Multi-speaker routing rules:',
-        '- Multiple group members may respond in one user turn when it makes scene sense.',
-        '- To trigger multiple next speakers, set speakingTo=ExactName|ExactName and participationNextTurn=speak.',
-        '- The order of names in speakingTo is the order Aspect: Vocalia should attempt to trigger them.',
-        `- Do not name more than ${maxParticipants} unique next speakers unless absolutely necessary.`,
-        `- Vocalia may allow up to ${maxParticipants} unique participants, ${maxResponses} total assistant responses, and ${maxPerParticipant} response(s) per participant in the current user turn.`,
-        '',
-        'Parameter behavior rules:',
-        '- speakingTo names who should answer next. Use exact group member names separated by |, or user, or none.',
-        '- speakingTo=user means the human/persona should answer next. Never use user to refer to a group member.',
-        '- If a group member should answer next, use that group member’s exact name from the group member list, not user.',
-        hasRemoteSupport
-            ? '- participationNextTurn=speak means Aspect: Vocalia may trigger the named group member(s) in speakingTo if they are physically present or remote and still fit the current turn limits.'
-            : '- participationNextTurn=speak means Aspect: Vocalia may trigger the named group member(s) in speakingTo if they are present and still fit the current turn limits.',
-        '- participationNextTurn=idle means the active speaker is not proactively handing the floor to another assistant now. It does not prevent this character from answering the user later.',
-        '- participationNextTurn=departing means the active speaker leaves the scene after this response and becomes absent.',
-        '- Arrival declarations may appear in any valid assistant response when the scene state changes. Do not restrict arrivals to the first assistant response after a user message.',
-        '- Do not use a separate departing= parameter. Owner departure is only participationNextTurn=departing.',
-        '- Do not invent character names outside the group member list.',
-        '- When the scene no longer needs additional assistant responses, stop and wait for the user.',
-        settings.strictPrompt ? '- Malformed tags or duplicate parameters break routing. Exact tags, exact names, unique parameter keys, and unwrapped semantic segment text are more important than prose style.' : '',
-        '[End Aspect: Vocalia Group Speaker Router Protocol]',
-    ].filter(Boolean).join('\n');
+    const parameterSchema = hasRemoteSupport
+        ? '[parameters]speakingTo=ExactName|user|none, participationNextTurn=speak|idle|departing, arriving=ExactName|none, remote=ExactName|none[end parameters]'
+        : '[parameters]speakingTo=ExactName|user|none, participationNextTurn=speak|idle|departing, arriving=ExactName|none[end parameters]';
+
+    return {
+        tagPrefix,
+        allMembers: members.map(member => member.name).join(', ') || 'none',
+        presentMembers: present.map(member => member.name).join(', ') || 'none',
+        remoteMembers: remote.map(member => member.name).join(', ') || 'none',
+        absentMembers: absent.map(member => member.name).join(', ') || 'none',
+        pendingArrivals: pendingNames,
+        remoteMembersLine: hasRemoteSupport ? `Remote: ${remote.map(member => member.name).join(', ') || 'none'}` : '',
+        absentMembersLine: hasRemoteSupport
+            ? `Absent/unreachable: ${absent.map(member => member.name).join(', ') || 'none'}`
+            : `Absent: ${absent.map(member => member.name).join(', ') || 'none'}`,
+        parameterSchema,
+        maxParticipants: String(maxParticipants),
+        maxResponses: String(maxResponses),
+        maxPerParticipant: String(maxPerParticipant),
+    };
+}
+
+function renderProtocolInstructionTemplate(template, values = buildProtocolTemplateValues()) {
+    return String(template ?? '').replace(/\{\{([A-Za-z0-9_]+)\}\}/g, (_match, key) => {
+        if (!Object.hasOwn(values, key)) return '';
+        return String(values[key] ?? '');
+    });
+}
+
+function getProtocolInstructionPreviewText(key) {
+    return renderProtocolInstructionTemplate(getProtocolInstructionTemplate(key));
+}
+
+function buildInstructionPrompt() {
+    const group = getCurrentGroup();
+    if (!group) return '';
+
+    const settings = getSettings();
+    const hasRemoteSupport = typeof getRemoteMembers === 'function';
+    const values = buildProtocolTemplateValues();
+    const chunks = [];
+
+    for (const definition of VOCALIA_PROTOCOL_SECTION_DEFINITIONS) {
+        if (definition.remoteOnly && !hasRemoteSupport) continue;
+        if (definition.strictOnly && !settings.strictPrompt) continue;
+
+        const template = getProtocolInstructionTemplate(definition.key, settings);
+        const rendered = renderProtocolInstructionTemplate(template, values).trim();
+        if (rendered) chunks.push(rendered);
+    }
+
+    return chunks.join('\n\n');
 }
 
 function updateExtensionPrompt() {
@@ -3307,15 +2808,24 @@ function updateExtensionPrompt() {
 }
 
 // ============================================================================
-// Section 9. Structured Block Parsing
+// Section 11. Structured Block Parsing
 // ============================================================================
 // Purpose:
 // - Parse only canonical [character1=Name]...[end character1] blocks.
 // - Reject malformed [Name]...[end Name] outer wrappers by returning no blocks.
 // - Preserve ordered visible-content segments inside each character block.
 // - Accept both [end tag] and [/tag] inner segment closers for robustness.
+// - Repair obvious mismatched inner segment closers when the opener is known.
 // - Treat duplicate parameter keys as malformed metadata, not as recoverable.
 // ============================================================================
+
+const STRUCTURED_SEGMENT_TAGS = Object.freeze([
+    SEGMENT_DIALOGUE,
+    SEGMENT_ACTIONS,
+    SEGMENT_NARRATION,
+    SEGMENT_THOUGHTS,
+    SEGMENT_PARAMETERS,
+]);
 
 function parseTaggedField(body, tagNames) {
     const tags = Array.isArray(tagNames) ? tagNames : [tagNames];
@@ -3400,7 +2910,6 @@ function parseParameters(text) {
             meta.unknownKeys.push(key);
         }
 
-        // Store normalized canonical keys used by the rest of Vocalia.
         switch (key) {
             case 'speakingto':
                 result.speakingTo = value;
@@ -3425,7 +2934,6 @@ function parseParameters(text) {
                 break;
         }
 
-        // Also preserve the original spelling for diagnostics/compatibility.
         result[originalKey] = value;
     }
 
@@ -3443,14 +2951,39 @@ function parseParameters(text) {
     return result;
 }
 
+function buildStructuredSegmentRegex() {
+    const tags = STRUCTURED_SEGMENT_TAGS.map(escapeRegex).join('|');
+
+    return new RegExp(
+        `\\[(${tags})\\]([\\s\\S]*?)(?:\\[end\\s+(${tags})\\]|\\[\\/(${tags})\\]|\\[\\/end\\s+(${tags})\\])`,
+        'gi',
+    );
+}
+
 function parseOrderedSegments(body) {
-    const segmentRegex = /\[(dialogue|actions|narration|thoughts|parameters)\]([\s\S]*?)(?:\[end \1\]|\[\/\1\])/gi;
+    const segmentRegex = buildStructuredSegmentRegex();
     const segments = [];
+    const repairs = [];
 
     let match;
     while ((match = segmentRegex.exec(String(body ?? ''))) !== null) {
         const type = String(match[1] ?? '').trim().toLocaleLowerCase();
         const text = String(match[2] ?? '').trim();
+        const closer = String(match[3] ?? match[4] ?? match[5] ?? '').trim().toLocaleLowerCase();
+        const rawCloser = String(match[0] ?? '').match(/\[(end\s+[^\]]+|\/[^\]]+|\/end\s+[^\]]+)\]\s*$/i)?.[1] ?? '';
+        const mixedCloserStyle = /^\/end\s+/i.test(rawCloser);
+        const repaired = (!!closer && closer !== type) || mixedCloserStyle;
+
+        if (repaired) {
+            repairs.push({
+                opened: type,
+                closed: closer,
+                rawCloser,
+                start: match.index,
+                end: segmentRegex.lastIndex,
+                preview: String(match[0] ?? '').slice(0, 240),
+            });
+        }
 
         segments.push({
             type,
@@ -3458,8 +2991,16 @@ function parseOrderedSegments(body) {
             raw: match[0],
             start: match.index,
             end: segmentRegex.lastIndex,
+            closer,
+            repaired,
         });
     }
+
+    Object.defineProperty(segments, '__repairs', {
+        value: repairs,
+        enumerable: false,
+        configurable: true,
+    });
 
     return segments;
 }
@@ -3493,6 +3034,7 @@ function parseStructuredMessage(rawText) {
         const name = String(match[2] ?? '').trim();
         const body = String(match[3] ?? '');
         const segments = parseOrderedSegments(body);
+        const segmentRepairs = segments.__repairs ?? [];
         const parameterSegments = getParameterSegments(segments);
 
         const parametersText = parameterSegments.length
@@ -3522,6 +3064,14 @@ function parseStructuredMessage(rawText) {
             malformedReasons.push('no_visible_content');
         }
 
+        if (segmentRepairs.length) {
+            logVocaliaEvent('structured_parser.segment_closer_repaired', {
+                name,
+                token,
+                repairs: segmentRepairs,
+            });
+        }
+
         const routingMalformed = malformedReasons.length > 0;
 
         blocks.push({
@@ -3537,6 +3087,7 @@ function parseStructuredMessage(rawText) {
             parameters,
             parameterMeta,
             parameterSegments,
+            segmentRepairs,
             routingMalformed,
             malformedReasons,
             speakingTo: routingMalformed ? [] : splitNameArray(parameters.speakingTo ?? parameters.speakingto ?? 'none'),
@@ -3571,7 +3122,7 @@ function firstValidOwnerBlock(blocks, message) {
 }
 
 // ============================================================================
-// Section 10. Display Overlay Rendering
+// Section 12. Display Overlay Rendering
 // ============================================================================
 // Purpose:
 // - Preserve raw structured content in chat history.
@@ -3993,7 +3544,7 @@ function applyOverlaySettingToVisibleMessages() {
 }
 
 // ============================================================================
-// Section 11. Routing State Transitions
+// Section 13. Routing State Transitions
 // ============================================================================
 // Purpose:
 // - Apply parsed owner parameters to scene state.
@@ -4330,6 +3881,46 @@ function updateOwnerSeenState(block, ownerMember, messageId) {
     state.lastSpeakerAvatar = ownerMember.avatar;
 }
 
+function getAssistantCountSinceLatestUserFromChat(messageId = null) {
+    const chat = ctx().chat ?? [];
+    const end = Number.isInteger(Number(messageId))
+        ? Math.min(Number(messageId), chat.length - 1)
+        : chat.length - 1;
+
+    if (end < 0) return 0;
+
+    let count = 0;
+
+    for (let i = end; i >= 0; i -= 1) {
+        const message = chat[i];
+        if (!message || message.is_system) continue;
+        if (message.is_user) break;
+        count += 1;
+    }
+
+    return count;
+}
+
+function syncAssistantCountSinceUserFromChat(messageId = null, reason = 'sync') {
+    const state = getChatState();
+    const previous = Number(state.assistantCountSinceUser || 0);
+    const next = getAssistantCountSinceLatestUserFromChat(messageId);
+
+    state.assistantCountSinceUser = next;
+
+    if (previous !== next) {
+        logVocaliaEvent('assistant_count.synced', {
+            reason,
+            messageId: Number.isInteger(Number(messageId)) ? Number(messageId) : null,
+            previous,
+            next,
+            chatLength: ctx().chat?.length ?? null,
+        });
+    }
+
+    return next;
+}
+
 function applyOwnerBlockToState(block, ownerMember, messageId, firstAssistantForUserMessage) {
     const state = ensureStateForCurrentGroup();
 
@@ -4390,7 +3981,7 @@ function applyOwnerBlockToState(block, ownerMember, messageId, firstAssistantFor
         });
 
         state.lastParsedMessageId = messageId;
-        state.assistantCountSinceUser = Number(state.assistantCountSinceUser || 0) + 1;
+        syncAssistantCountSinceUserFromChat(messageId, 'malformed_owner_block');
         return [];
     }
 
@@ -4409,7 +4000,7 @@ function applyOwnerBlockToState(block, ownerMember, messageId, firstAssistantFor
     }
 
     state.lastParsedMessageId = messageId;
-    state.assistantCountSinceUser = Number(state.assistantCountSinceUser || 0) + 1;
+    syncAssistantCountSinceUserFromChat(messageId, 'owner_block_applied');
 
     logVocaliaEvent('owner_block.apply.end', {
         messageId,
@@ -4424,7 +4015,7 @@ function applyOwnerBlockToState(block, ownerMember, messageId, firstAssistantFor
 }
 
 // ============================================================================
-// Section 12. Trigger Execution
+// Section 14. Trigger Execution
 // ============================================================================
 // Purpose:
 // - Invoke /trigger silently when possible.
@@ -4498,14 +4089,19 @@ async function triggerMember(member) {
 }
 
 // ============================================================================
-// Section 13. Trigger Queue and Chain Control
+// Section 15. Trigger Queue and Chain Control
 // ============================================================================
 // Purpose:
 // - Serialize group member triggers.
 // - Enforce true per-turn unique-participant and total-response limits.
 // - Enforce per-participant response limits.
+// - Persist allowance counts without migration wiping live turn state.
 // - Wait for the triggered assistant's actual MESSAGE_RECEIVED before continuing.
 // - Expose the active target avatar for the generate_interceptor.
+// - Clean up pending trigger waiters only when generation is explicitly stopped,
+//   aborted, timed out, or invalidated by chat/group changes.
+// - Treat GENERATION_ENDED as observational only; it is not proof that no
+//   MESSAGE_RECEIVED will arrive.
 // - Handle deferred-arrival application at chain end.
 // - Validate route eligibility against physical-present OR remote members.
 // ============================================================================
@@ -4544,8 +4140,199 @@ function getActiveGenerationTargetMember() {
     return getMemberByAvatar(vocaliaActiveGenerationTargetAvatar, getGroupMembers());
 }
 
+function recordTriggerAttemptInterrupted(attempt, reason = 'generation_interrupted') {
+    if (!attempt) return null;
+
+    attempt.stage = 'interrupted';
+    attempt.interruptedAtMs = Date.now();
+    attempt.interruptedAtIso = new Date().toISOString();
+    attempt.endedAtMs = attempt.interruptedAtMs;
+    attempt.endedAtIso = attempt.interruptedAtIso;
+    attempt.chatLengthAfter = ctx().chat?.length ?? null;
+    attempt.completed = false;
+    attempt.failed = true;
+    attempt.timedOut = false;
+    attempt.error = {
+        name: 'VocaliaGenerationInterrupted',
+        message: String(reason || 'generation_interrupted'),
+    };
+
+    logVocaliaEvent('trigger.attempt.interrupted', {
+        attempt: safeLogClone(attempt),
+        reason,
+    });
+
+    return attempt;
+}
+
+function resolvePendingTriggerWaitersFromExistingTail(reason = 'generation_lifecycle_check') {
+    const context = ctx();
+    const chat = context.chat ?? [];
+    const lastMessageId = chat.length - 1;
+    const lastMessage = chat[lastMessageId];
+
+    if (!lastMessage || lastMessage.is_user || lastMessage.is_system) return [];
+
+    const resolved = resolvePendingTriggerWaitersForMessage(lastMessageId, lastMessage);
+
+    if (resolved.length) {
+        logVocaliaEvent('trigger.waiter.resolved_from_existing_tail', {
+            reason,
+            messageId: lastMessageId,
+            message: getMessageDebugSummary(lastMessageId),
+            resolved: resolved.map(item => ({
+                status: item.status,
+                attemptId: item.attempt?.id ?? null,
+                memberName: item.attempt?.memberName ?? null,
+            })),
+        });
+    }
+
+    return resolved;
+}
+
+function resolvePendingTriggerWaitersAsInterrupted(reason = 'generation_interrupted', eventValue = null) {
+    if (!hasPendingTriggerWaiters()) return [];
+
+    resolvePendingTriggerWaitersFromExistingTail(`${reason}:tail_check`);
+    if (!hasPendingTriggerWaiters()) return [];
+
+    const activeAvatar = vocaliaActiveGenerationTargetAvatar;
+    const matching = activeAvatar
+        ? vocaliaPendingTriggerWaiters.filter(waiter => waiter.memberAvatar === activeAvatar)
+        : [...vocaliaPendingTriggerWaiters];
+
+    if (!matching.length) return [];
+
+    const resolved = [];
+
+    for (const waiter of matching) {
+        recordTriggerAttemptInterrupted(waiter.attempt, reason);
+        unmarkTriggeredThisTurn(waiter.memberAvatar, reason);
+
+        const result = {
+            status: 'generation_interrupted',
+            attempt: waiter.attempt,
+            messageId: null,
+            message: null,
+            reason,
+        };
+
+        resolved.push(result);
+        resolveTriggeredWaiter(waiter, result);
+    }
+
+    triggerQueue = [];
+    queueRunning = false;
+
+    clearActiveGenerationTarget(reason);
+    maybeApplyDeferredArrivalsAtChainEnd();
+    updateDiagnosticsPanel();
+    saveMetadata();
+
+    logVocaliaEvent('trigger.waiter.resolved_by_generation_interrupted', {
+        reason,
+        eventValue: safeLogClone(eventValue),
+        resolved: resolved.map(item => ({
+            status: item.status,
+            attemptId: item.attempt?.id ?? null,
+            memberName: item.attempt?.memberName ?? null,
+        })),
+    }, { force: true });
+
+    return resolved;
+}
+
+function scheduleGenerationInterruptedCleanup(reason = 'generation_interrupted', eventValue = null) {
+    if (!hasPendingTriggerWaiters()) {
+        logVocaliaEvent('generation_lifecycle.cleanup_skipped', {
+            reason,
+            eventValue: safeLogClone(eventValue),
+            cause: 'no_pending_waiters',
+        });
+
+        return;
+    }
+
+    const activeSnapshot = {
+        avatar: vocaliaActiveGenerationTargetAvatar,
+        name: vocaliaActiveGenerationTargetName,
+        startedAt: vocaliaActiveGenerationTargetStartedAt,
+        targetReason: vocaliaActiveGenerationTargetReason,
+    };
+
+    logVocaliaEvent('generation_lifecycle.cleanup_scheduled', {
+        reason,
+        eventValue: safeLogClone(eventValue),
+        activeSnapshot,
+        pendingTriggerWaiters: getPendingTriggerWaiterDebugSnapshot(),
+    }, { force: true });
+
+    setTimeout(() => {
+        if (!hasPendingTriggerWaiters()) {
+            logVocaliaEvent('generation_lifecycle.cleanup_cancelled', {
+                reason,
+                cause: 'waiters_already_resolved',
+            });
+
+            return;
+        }
+
+        resolvePendingTriggerWaitersAsInterrupted(reason, eventValue);
+    }, 250);
+}
+
+function scheduleGenerationEndedTailChecks(reason = 'generation_ended_observed', eventValue = null) {
+    const delays = [0, 250, 1000, 2500];
+
+    for (const delay of delays) {
+        setTimeout(() => {
+            if (!hasPendingTriggerWaiters()) {
+                logVocaliaEvent('generation_lifecycle.ended_tail_check_skipped', {
+                    reason,
+                    delay,
+                    cause: 'no_pending_waiters',
+                });
+                return;
+            }
+
+            const resolved = resolvePendingTriggerWaitersFromExistingTail(`${reason}:tail_check:${delay}`);
+
+            logVocaliaEvent('generation_lifecycle.ended_tail_check', {
+                reason,
+                delay,
+                eventValue: safeLogClone(eventValue),
+                resolvedCount: resolved.length,
+                pendingTriggerWaiters: getPendingTriggerWaiterDebugSnapshot(),
+                note: 'GENERATION_ENDED is observational only; pending waiters are not interrupted here.',
+            });
+        }, delay);
+    }
+}
+
+function handleGenerationLifecycleStopped(eventValue) {
+    scheduleGenerationInterruptedCleanup('generation_stopped_or_aborted', eventValue);
+}
+
+function handleGenerationLifecycleEnded(eventValue) {
+    logVocaliaEvent('generation_lifecycle.ended_observed', {
+        eventValue: safeLogClone(eventValue),
+        pendingTriggerWaiters: getPendingTriggerWaiterDebugSnapshot(),
+        activeTarget: {
+            avatar: vocaliaActiveGenerationTargetAvatar,
+            name: vocaliaActiveGenerationTargetName,
+            startedAt: vocaliaActiveGenerationTargetStartedAt,
+            reason: vocaliaActiveGenerationTargetReason,
+        },
+        note: 'GENERATION_ENDED is not treated as interruption. Waiting continues until MESSAGE_RECEIVED, timeout, explicit stop, or chat/group invalidation.',
+    }, { force: true });
+
+    scheduleGenerationEndedTailChecks('generation_ended_observed', eventValue);
+}
+
 function syncTriggeredThisTurnFromCounts(state = getChatState()) {
-    const counts = state.participantResponseCountsThisTurn ?? {};
+    const counts = normalizeParticipantResponseCounts(state.participantResponseCountsThisTurn ?? {});
+    state.participantResponseCountsThisTurn = counts;
     state.triggeredThisTurn = Object.entries(counts)
         .filter(([_avatar, count]) => Number(count || 0) > 0)
         .map(([avatar]) => avatar);
@@ -4560,8 +4347,7 @@ function resetTurnResponseTracking(state = getChatState()) {
 }
 
 function getParticipantResponseCountsThisTurn(state = getChatState()) {
-    state.participantResponseCountsThisTurn ??= {};
-    migrateTurnTrackingState(state);
+    state.participantResponseCountsThisTurn = normalizeParticipantResponseCounts(state.participantResponseCountsThisTurn ?? {});
     return state.participantResponseCountsThisTurn;
 }
 
@@ -4615,21 +4401,26 @@ function getTurnLimitSettings() {
 }
 
 function markTriggeredThisTurn(member) {
-    if (!member) return;
+    if (!member?.avatar) return;
 
     const state = getChatState();
     const counts = getParticipantResponseCountsThisTurn(state);
 
     counts[member.avatar] = Number(counts[member.avatar] || 0) + 1;
-    state.chainCount = getTotalResponsesThisTurn(state);
-    syncTriggeredThisTurnFromCounts(state);
+
+    state.participantResponseCountsThisTurn = counts;
+    state.triggeredThisTurn = Object.entries(counts)
+        .filter(([_avatar, count]) => Number(count || 0) > 0)
+        .map(([avatar]) => avatar);
+
+    state.chainCount = Object.values(counts).reduce((sum, count) => sum + Number(count || 0), 0);
 
     logVocaliaEvent('allowance.mark_spent', {
         member: memberDebugSummary(member),
         participantResponseCountsThisTurn: safeLogClone(state.participantResponseCountsThisTurn),
         triggeredThisTurn: arrayDebugNames(state.triggeredThisTurn),
-        totalResponsesThisTurn: getTotalResponsesThisTurn(state),
-        uniqueParticipantsThisTurn: getUniqueParticipantsThisTurn(state),
+        totalResponsesThisTurn: state.chainCount,
+        uniqueParticipantsThisTurn: state.triggeredThisTurn.length,
     });
 }
 
@@ -4649,8 +4440,10 @@ function unmarkTriggeredThisTurn(memberOrAvatar, reason = 'unspecified') {
         delete counts[avatar];
     }
 
-    state.chainCount = getTotalResponsesThisTurn(state);
-    syncTriggeredThisTurnFromCounts(state);
+    state.participantResponseCountsThisTurn = normalizeParticipantResponseCounts(counts);
+    state.triggeredThisTurn = Object.keys(state.participantResponseCountsThisTurn);
+    state.chainCount = Object.values(state.participantResponseCountsThisTurn)
+        .reduce((sum, count) => sum + Number(count || 0), 0);
 
     logVocaliaEvent('allowance.mark_released', {
         avatar,
@@ -4694,7 +4487,7 @@ function filterTriggerAllowance(members) {
     const accepted = [];
 
     const projectedCounts = {
-        ...(state.participantResponseCountsThisTurn ?? {}),
+        ...getParticipantResponseCountsThisTurn(state),
     };
 
     for (const [avatar, count] of Object.entries(getQueuedResponseCounts())) {
@@ -5010,6 +4803,18 @@ async function runTriggerQueue() {
                     break;
                 }
 
+                if (waitResult.status === 'generation_interrupted') {
+                    triggerQueue = [];
+
+                    logVocaliaEvent('queue.run.stopped_after_generation_interrupted', {
+                        latestMember: memberDebugSummary(latestMember),
+                        attemptId: attempt.id,
+                        reason: waitResult.reason ?? 'generation_interrupted',
+                    }, { force: true });
+
+                    break;
+                }
+
                 logVocaliaEvent('trigger.call.end', {
                     latestMember: memberDebugSummary(latestMember),
                     reason: item.reason,
@@ -5045,7 +4850,7 @@ async function runTriggerQueue() {
 }
 
 // ============================================================================
-// Section 14. SillyTavern Event Handlers and Send / Native Generation Guard
+// Section 16. SillyTavern Event Handlers and Send / Native Generation Guard
 // ============================================================================
 // Purpose:
 // - React to user messages, assistant messages, renders, chat changes, and group changes.
@@ -5053,12 +4858,44 @@ async function runTriggerQueue() {
 //   a random unmuted group member.
 // - Intercept Regenerate and Continue before native group generation can choose
 //   an absent/random member.
+// - Regenerate targets the current assistant tail message, never the prior user message.
 // - Regenerate uses SillyTavern-style safe tail deletion with deleteLastMessage(),
 //   never /cut.
+// - Guard controlled generation sessions: after one accepted controlled response,
+//   any extra native same-turn assistant message without a Vocalia waiter is refused
+//   for routing/state changes, even if the message text is different.
+// - Keep broad pointer/touch coverage for Regenerate / Continue controls.
+// - Trigger Empty Send only from explicit send intent: Send button, send form, or
+//   plain Enter inside the composer. Never trigger Empty Send from textbox focus/click.
 // - Tag each message with witness metadata.
 // - Filter prompt-building chat history per active target via generate_interceptor.
 // - Treat native/bypass output as display-only when unsafe.
+// - Derive assistantCountSinceUser from actual chat history instead of allowing
+//   stale counters to accumulate across regenerate/delete cycles.
 // ============================================================================
+
+let vocaliaControlledGenerationSession = null;
+
+const VOCALIA_CONTROLLED_GENERATION_GUARD_EVENTS = Object.freeze([
+    'pointerdown',
+    'mousedown',
+    'mouseup',
+    'click',
+    'touchstart',
+]);
+
+const VOCALIA_EMPTY_SEND_BUTTON_SELECTORS = [
+    '#send_but',
+    '#send_button',
+    '.send_but',
+    '.send_button',
+    '[data-i18n="[title]Send"]',
+    '[data-i18n="Send"]',
+    '[title="Send"]',
+    '[title="Send message"]',
+    '[aria-label="Send"]',
+    '[aria-label="Send message"]',
+].join(',');
 
 function isMemberInRouteEligibleList(member, eligibleMembers = getRouteEligibleMembersCompat()) {
     return !!member && eligibleMembers.some(eligibleMember => eligibleMember.avatar === member.avatar);
@@ -5148,7 +4985,7 @@ function getDirectUserMessageWitnessTargets(text) {
 
 function recordWitnessesForUserMessage(messageId, reason = 'user_message') {
     const message = ctx().chat?.[Number(messageId)];
-    if (!message || !message.is_user) return [];
+    if (!message || !message.is_user || message.is_system) return [];
 
     const text = String(message.mes ?? '');
     const witnesses = getCurrentWitnessAvatarSet(getDirectUserMessageWitnessTargets(text));
@@ -5160,10 +4997,9 @@ function recordWitnessesForAssistantMessage(messageId, message, ownerBlock = nul
     if (!message || message.is_user || message.is_system) return [];
 
     const additional = [];
-
     const messageOwner = getMessageOwnerMember(message);
-    if (messageOwner?.avatar) additional.push(messageOwner.avatar);
 
+    if (messageOwner?.avatar) additional.push(messageOwner.avatar);
     if (ownerMember?.avatar) additional.push(ownerMember.avatar);
 
     if (ownerBlock?.name) {
@@ -5274,6 +5110,144 @@ async function aspectVocaliaGenerateInterceptor(chat, contextSize, abort, type) 
 
 globalThis[VOCALIA_GENERATE_INTERCEPTOR_NAME] = aspectVocaliaGenerateInterceptor;
 
+function createControlledGenerationSession(action, target, source) {
+    const now = Date.now();
+
+    vocaliaControlledGenerationSession = {
+        id: `${action}:${target?.member?.avatar ?? 'unknown'}:${now}`,
+        action,
+        source,
+        startedAtMs: now,
+        startedAtIso: new Date(now).toISOString(),
+        sourceMessageId: Number.isInteger(Number(target?.messageId)) ? Number(target.messageId) : null,
+        targetMessageId: Number.isInteger(Number(target?.messageId)) ? Number(target.messageId) : null,
+        targetAvatar: target?.member?.avatar ?? null,
+        targetName: target?.member?.name ?? null,
+        acceptedMessageIds: [],
+        acceptedCount: 0,
+        maxAcceptedMessages: 1,
+        active: true,
+    };
+
+    logVocaliaEvent('controlled_generation.session.start', {
+        session: safeLogClone(vocaliaControlledGenerationSession),
+    }, { force: true });
+
+    return vocaliaControlledGenerationSession;
+}
+
+function clearControlledGenerationSession(reason = 'unspecified') {
+    if (!vocaliaControlledGenerationSession) return;
+
+    logVocaliaEvent('controlled_generation.session.clear', {
+        reason,
+        session: safeLogClone(vocaliaControlledGenerationSession),
+    }, { force: true });
+
+    vocaliaControlledGenerationSession = null;
+}
+
+function isControlledGenerationSessionActive() {
+    return !!(
+        vocaliaControlledGenerationSession
+        && vocaliaControlledGenerationSession.active
+        && vocaliaControlledGenerationSession.targetAvatar
+    );
+}
+
+function noteControlledGenerationAcceptedMessage(messageId, message, waiterResults = []) {
+    if (!isControlledGenerationSessionActive()) return false;
+    if (!waiterResults.length) return false;
+
+    const matched = waiterResults.some(result => (
+        result?.attempt?.memberAvatar === vocaliaControlledGenerationSession.targetAvatar
+        && String(result?.attempt?.reason ?? '').startsWith(`controlled-${vocaliaControlledGenerationSession.action}`)
+    ));
+
+    if (!matched) return false;
+
+    const id = Number(messageId);
+    if (!vocaliaControlledGenerationSession.acceptedMessageIds.includes(id)) {
+        vocaliaControlledGenerationSession.acceptedMessageIds.push(id);
+    }
+
+    vocaliaControlledGenerationSession.acceptedCount = vocaliaControlledGenerationSession.acceptedMessageIds.length;
+    vocaliaControlledGenerationSession.lastAcceptedAtMs = Date.now();
+    vocaliaControlledGenerationSession.lastAcceptedAtIso = new Date().toISOString();
+
+    logVocaliaEvent('controlled_generation.session.accepted_message', {
+        session: safeLogClone(vocaliaControlledGenerationSession),
+        messageId: id,
+        message: getMessageDebugSummary(id),
+        waiterResults: waiterResults.map(result => ({
+            status: result.status,
+            attemptId: result.attempt?.id ?? null,
+            memberName: result.attempt?.memberName ?? null,
+            reason: result.attempt?.reason ?? null,
+        })),
+    }, { force: true });
+
+    return true;
+}
+
+function shouldRefuseExtraControlledGenerationMessage(messageId, message, ownerBlock, ownerMember, waiterResults = []) {
+    if (!isControlledGenerationSessionActive()) {
+        return {
+            refused: false,
+            reason: 'no_active_controlled_generation_session',
+        };
+    }
+
+    if (waiterResults.length) {
+        return {
+            refused: false,
+            reason: 'message_matched_vocalia_waiter',
+        };
+    }
+
+    if (!message || message.is_user || message.is_system) {
+        return {
+            refused: false,
+            reason: 'not_assistant_message',
+        };
+    }
+
+    if (vocaliaControlledGenerationSession.acceptedCount < vocaliaControlledGenerationSession.maxAcceptedMessages) {
+        return {
+            refused: false,
+            reason: 'controlled_session_has_not_accepted_expected_message_yet',
+        };
+    }
+
+    const id = Number(messageId);
+    if (vocaliaControlledGenerationSession.acceptedMessageIds.includes(id)) {
+        return {
+            refused: false,
+            reason: 'accepted_controlled_message',
+        };
+    }
+
+    const messageOwner = getMessageOwnerMember(message);
+    const sameTargetOwner = (
+        messageOwner?.avatar === vocaliaControlledGenerationSession.targetAvatar
+        || ownerMember?.avatar === vocaliaControlledGenerationSession.targetAvatar
+    );
+
+    return {
+        refused: true,
+        reason: sameTargetOwner
+            ? 'native_extra_same_participant_after_controlled_generation'
+            : 'native_extra_assistant_after_controlled_generation',
+        session: safeLogClone(vocaliaControlledGenerationSession),
+        messageOwner,
+        ownerBlock,
+        ownerMember,
+        messageOwnerEligible: messageOwner ? isMemberRouteEligibleCompat(messageOwner) : false,
+        structuredOwnerEligible: ownerMember ? isMemberRouteEligibleCompat(ownerMember) : false,
+        ownerMismatch: !!messageOwner && !!ownerMember && messageOwner.avatar !== ownerMember.avatar,
+    };
+}
+
 function getNoResponderBlockReason(text) {
     if (!getSettings().enabled) return null;
     if (!ctx().groupId) return null;
@@ -5289,35 +5263,8 @@ function getNoResponderBlockReason(text) {
 
     return {
         reason: 'no_route_eligible_member_and_no_user_summon_or_departure',
-        textPreview: String(text ?? '').slice(0, 500),
-        eligibleMembers: [],
-        summonEvidence: summon.evidence,
-        departureEvidence: departure.evidence,
+        text,
     };
-}
-
-function shouldBlockCurrentTypedSend() {
-    // Normal typed user messages must be allowed even when every group member
-    // is absent. Vocalia can then record the user-only scene beat and simply
-    // choose no assistant trigger.
-    //
-    // Empty Send is still intercepted separately by interceptEmptySendEvent()
-    // because empty Send is the path that can invoke native random group generation.
-    return null;
-}
-
-function blockTypedSendEvent(event, source) {
-    const text = getCurrentComposerText();
-    const reason = getNoResponderBlockReason(text);
-
-    if (reason) {
-        logVocaliaEvent('send.no_responder_allowed_user_only_turn', {
-            source,
-            reason,
-        }, { force: true });
-    }
-
-    return false;
 }
 
 function stopNativeSendEvent(event) {
@@ -5326,9 +5273,8 @@ function stopNativeSendEvent(event) {
     event.stopImmediatePropagation?.();
 }
 
-function getClickableActionElement(target) {
-    const element = target instanceof Element ? target : null;
-    if (!element) return null;
+function getClickableActionElement(element) {
+    if (!(element instanceof Element)) return null;
 
     return element.closest([
         'button',
@@ -5479,12 +5425,13 @@ function getStructuredOwnerMemberFromMessage(message) {
     };
 }
 
-function getRouteEligibleCandidateFromMessage(messageId) {
-    const message = ctx().chat?.[Number(messageId)];
+function resolveMessageTargetOwner(messageId) {
+    const id = Number(messageId);
+    const message = ctx().chat?.[id];
 
-    if (!message || message.is_user || message.is_system) {
+    if (!Number.isInteger(id) || !message || message.is_user || message.is_system) {
         return {
-            messageId,
+            messageId: Number.isInteger(id) ? id : null,
             message,
             member: null,
             source: 'missing_or_non_assistant_message',
@@ -5498,7 +5445,7 @@ function getRouteEligibleCandidateFromMessage(messageId) {
 
     if (messageOwner && isMemberRouteEligibleCompat(messageOwner)) {
         return {
-            messageId,
+            messageId: id,
             message,
             member: messageOwner,
             source: 'message_owner',
@@ -5512,7 +5459,7 @@ function getRouteEligibleCandidateFromMessage(messageId) {
 
     if (ownerMember && isMemberRouteEligibleCompat(ownerMember)) {
         return {
-            messageId,
+            messageId: id,
             message,
             member: ownerMember,
             source: 'structured_block_owner',
@@ -5523,7 +5470,7 @@ function getRouteEligibleCandidateFromMessage(messageId) {
     }
 
     return {
-        messageId,
+        messageId: id,
         message,
         member: null,
         source: 'no_route_eligible_message_or_structured_owner',
@@ -5533,107 +5480,9 @@ function getRouteEligibleCandidateFromMessage(messageId) {
     };
 }
 
-function getControlledActionFallbackTarget(action, targetMessageId) {
-    const state = ensureStateForCurrentGroup();
-
-    if (state.waitingForUserByAvatar) {
-        const waitingMember = getMemberByAvatar(state.waitingForUserByAvatar);
-
-        if (waitingMember && isMemberRouteEligibleCompat(waitingMember)) {
-            return {
-                messageId: targetMessageId,
-                message: ctx().chat?.[Number(targetMessageId)],
-                member: waitingMember,
-                source: 'waiting_for_user',
-                reason: `controlled-${action}-waiting-for-user`,
-            };
-        }
-    }
-
-    if (state.lastSpeakerAvatar) {
-        const lastSpeaker = getMemberByAvatar(state.lastSpeakerAvatar);
-
-        if (lastSpeaker && isMemberRouteEligibleCompat(lastSpeaker)) {
-            return {
-                messageId: targetMessageId,
-                message: ctx().chat?.[Number(targetMessageId)],
-                member: lastSpeaker,
-                source: 'last_speaker',
-                reason: `controlled-${action}-last-speaker`,
-            };
-        }
-    }
-
-    const prior = findMostRecentRouteEligibleAssistantBefore(ctx().chat?.length ?? 0);
-
-    if (prior?.member) {
-        return {
-            messageId: prior.messageId,
-            message: prior.message,
-            member: prior.member,
-            source: 'prior_route_eligible_assistant',
-            reason: `controlled-${action}-prior-route-eligible-assistant`,
-        };
-    }
-
-    const eligible = getRouteEligibleMembersCompat();
-
-    if (eligible.length === 1) {
-        return {
-            messageId: targetMessageId,
-            message: ctx().chat?.[Number(targetMessageId)],
-            member: eligible[0],
-            source: 'sole_route_eligible_member',
-            reason: `controlled-${action}-sole-route-eligible-member`,
-        };
-    }
-
-    return {
-        messageId: targetMessageId,
-        message: ctx().chat?.[Number(targetMessageId)],
-        member: null,
-        source: 'no_controlled_action_target',
-        reason: `controlled-${action}-no-target`,
-    };
-}
-
-function resolveControlledGenerationTarget(action, clickedElement) {
-    const explicitMessageId = getMessageIdFromDomElement(clickedElement);
-    const targetMessageId = Number.isInteger(Number(explicitMessageId))
-        ? Number(explicitMessageId)
-        : findLastAssistantMessageId();
-
-    const messageCandidate = getRouteEligibleCandidateFromMessage(targetMessageId);
-
-    if (messageCandidate.member) {
-        return {
-            ...messageCandidate,
-            action,
-            reason: `controlled-${action}-${messageCandidate.source}`,
-        };
-    }
-
-    const fallback = getControlledActionFallbackTarget(action, targetMessageId);
-
-    return {
-        ...fallback,
-        action,
-        reason: fallback.reason ?? `controlled-${action}-${fallback.source}`,
-        ownerBlock: messageCandidate.ownerBlock ?? fallback.ownerBlock ?? null,
-        rejectedMessageCandidate: {
-            source: messageCandidate.source,
-            messageOwner: memberDebugSummary(messageCandidate.messageOwner),
-            structuredOwner: memberDebugSummary(messageCandidate.structuredOwner),
-        },
-    };
-}
-
 function getTailRegenerateDeleteWindow() {
     const chat = ctx().chat ?? [];
     const end = chat.length - 1;
-
-    if (end < 0) return null;
-
     const lastMessage = chat[end];
 
     if (!lastMessage || lastMessage.is_user || lastMessage.is_system) {
@@ -5679,6 +5528,160 @@ function isMessageIdInsideWindow(messageId, window) {
         && id >= window.start
         && id <= window.end
     );
+}
+
+function getControlledActionFallbackTarget(action, targetMessageId, rejectedMessageCandidate = null) {
+    const state = ensureStateForCurrentGroup();
+
+    if (state.waitingForUserByAvatar) {
+        const waitingMember = getMemberByAvatar(state.waitingForUserByAvatar);
+
+        if (waitingMember && isMemberRouteEligibleCompat(waitingMember)) {
+            return {
+                messageId: targetMessageId,
+                message: ctx().chat?.[Number(targetMessageId)],
+                member: waitingMember,
+                source: 'waiting_for_user',
+                reason: `controlled-${action}-waiting-for-user`,
+                rejectedMessageCandidate,
+            };
+        }
+    }
+
+    if (state.lastSpeakerAvatar) {
+        const lastSpeaker = getMemberByAvatar(state.lastSpeakerAvatar);
+
+        if (lastSpeaker && isMemberRouteEligibleCompat(lastSpeaker)) {
+            return {
+                messageId: targetMessageId,
+                message: ctx().chat?.[Number(targetMessageId)],
+                member: lastSpeaker,
+                source: 'last_speaker',
+                reason: `controlled-${action}-last-speaker`,
+                rejectedMessageCandidate,
+            };
+        }
+    }
+
+    const prior = findMostRecentRouteEligibleAssistantBefore(ctx().chat?.length ?? 0);
+
+    if (prior?.member) {
+        return {
+            messageId: targetMessageId,
+            message: ctx().chat?.[Number(targetMessageId)],
+            member: prior.member,
+            source: 'prior_route_eligible_assistant',
+            reason: `controlled-${action}-prior-route-eligible-assistant`,
+            rejectedMessageCandidate,
+        };
+    }
+
+    const eligible = getRouteEligibleMembersCompat();
+
+    if (eligible.length === 1) {
+        return {
+            messageId: targetMessageId,
+            message: ctx().chat?.[Number(targetMessageId)],
+            member: eligible[0],
+            source: 'sole_route_eligible_member',
+            reason: `controlled-${action}-sole-route-eligible-member`,
+            rejectedMessageCandidate,
+        };
+    }
+
+    return {
+        messageId: targetMessageId,
+        message: ctx().chat?.[Number(targetMessageId)],
+        member: null,
+        source: 'no_controlled_action_target',
+        reason: `controlled-${action}-no-target`,
+        rejectedMessageCandidate,
+    };
+}
+
+function resolveRegenerateTargetFromCurrentAssistantTail(explicitMessageId) {
+    const window = getTailRegenerateDeleteWindow();
+
+    if (!window || window.count <= 0) {
+        const fallbackId = findLastAssistantMessageId();
+        const fallbackCandidate = Number.isInteger(Number(fallbackId))
+            ? resolveMessageTargetOwner(Number(fallbackId))
+            : null;
+
+        return fallbackCandidate ?? {
+            messageId: null,
+            message: null,
+            member: null,
+            source: 'no_safe_tail_window',
+            reason: 'controlled-regenerate-no-safe-tail-window',
+            rejectedMessageCandidate: null,
+        };
+    }
+
+    if (Number.isInteger(Number(explicitMessageId))) {
+        const explicitId = Number(explicitMessageId);
+        const explicitCandidate = resolveMessageTargetOwner(explicitId);
+
+        if (isMessageIdInsideWindow(explicitId, window)) {
+            if (explicitCandidate.member) {
+                return {
+                    ...explicitCandidate,
+                    reason: `controlled-regenerate-${explicitCandidate.source}`,
+                };
+            }
+
+            return getControlledActionFallbackTarget('regenerate', explicitId, explicitCandidate);
+        }
+
+        if (explicitCandidate.message && !explicitCandidate.message.is_user && !explicitCandidate.message.is_system) {
+            return {
+                ...explicitCandidate,
+                reason: 'controlled-regenerate-explicit-message-outside-current-tail',
+            };
+        }
+    }
+
+    const tailMessageId = window.end;
+    const tailCandidate = resolveMessageTargetOwner(tailMessageId);
+
+    if (tailCandidate.member) {
+        return {
+            ...tailCandidate,
+            reason: `controlled-regenerate-${tailCandidate.source}`,
+        };
+    }
+
+    return getControlledActionFallbackTarget('regenerate', tailMessageId, tailCandidate);
+}
+
+function resolveContinueTarget(clickedElement) {
+    const explicitMessageId = getMessageIdFromDomElement(clickedElement);
+    const targetMessageId = Number.isInteger(Number(explicitMessageId))
+        ? Number(explicitMessageId)
+        : findLastAssistantMessageId();
+
+    const candidate = Number.isInteger(Number(targetMessageId))
+        ? resolveMessageTargetOwner(Number(targetMessageId))
+        : null;
+
+    if (candidate?.member) {
+        return {
+            ...candidate,
+            reason: `controlled-continue-${candidate.source}`,
+        };
+    }
+
+    return getControlledActionFallbackTarget('continue', targetMessageId, candidate);
+}
+
+function resolveControlledGenerationTarget(action, clickedElement) {
+    const explicitMessageId = getMessageIdFromDomElement(clickedElement);
+
+    if (action === 'regenerate') {
+        return resolveRegenerateTargetFromCurrentAssistantTail(explicitMessageId);
+    }
+
+    return resolveContinueTarget(clickedElement);
 }
 
 async function deleteTailForVocaliaRegenerate(targetMessageId) {
@@ -5761,188 +5764,36 @@ async function deleteTailForVocaliaRegenerate(targetMessageId) {
             break;
         }
 
-        const currentGenerationId = currentLastMessage.extra?.gen_id ?? null;
-
-        if ((window.generationId && currentGenerationId) && currentGenerationId !== window.generationId) {
-            logVocaliaEvent('controlled_generation.tail_delete_stopped', {
-                reason: 'generation_id_changed',
-                currentLastId,
-                currentGenerationId,
-                expectedGenerationId: window.generationId,
-                deleted,
-                window,
-            }, { force: true });
-
-            break;
-        }
-
         await importedDeleteLastMessage();
         deleted += 1;
-
-        logVocaliaEvent('controlled_generation.tail_delete_one', {
-            deleted,
-            expectedCount: window.count,
-            remainingChatLength: ctx().chat?.length ?? null,
-        }, { force: true });
     }
 
-    const success = deleted === window.count;
-
-    logVocaliaEvent('controlled_generation.tail_delete_end', {
-        success,
+    logVocaliaEvent('controlled_generation.tail_delete_done', {
+        targetMessageId,
+        window,
         deleted,
-        expectedCount: window.count,
-        beforeWindow: window,
-        afterChatLength: ctx().chat?.length ?? null,
+        chatLengthAfter: ctx().chat?.length ?? null,
     }, { force: true });
 
-    if (!success) {
-        globalThis.toastr?.warning(
-            'Vocalia regenerate stopped early to avoid deleting unsafe messages.',
-            MODULE_DISPLAY_NAME,
-        );
-    }
-
-    return success;
+    return deleted > 0;
 }
 
-async function handleVocaliaEmptySendContinuation(source) {
-    if (vocaliaEmptySendInProgress) {
-        logVocaliaEvent('empty_send.ignored_already_in_progress', {
-            source,
-        });
-
-        return;
-    }
-
-    if (queueRunning || hasPendingTriggerWaiters()) {
-        logVocaliaEvent('empty_send.ignored_generation_pending', {
-            source,
-            queueRunning,
-            pendingTriggerWaiters: getPendingTriggerWaiterDebugSnapshot(),
-        }, { force: true });
-
-        globalThis.toastr?.info(
-            'A Vocalia-triggered reply is still pending. Wait for it to finish before continuing.',
-            MODULE_DISPLAY_NAME,
-        );
-
-        return;
-    }
-
-    vocaliaEmptySendInProgress = true;
-
-    try {
-        const context = ctx();
-
-        if (!getSettings().enabled || !context.groupId) {
-            logVocaliaEvent('empty_send.ignored', {
-                source,
-                reason: !getSettings().enabled ? 'settings_disabled' : 'not_group_chat',
-            });
-
-            return;
-        }
-
-        ensureStateForCurrentGroup();
-        await forceManualStrategyForCurrentGroup();
-
-        const latest = getLatestUnansweredUserMessage?.();
-        if (latest) {
-            recordWitnessesForUserMessage(latest.messageId, 'empty_send_recovery_latest_user');
-        }
-
-        const state = getChatState();
-
-        state.chainCount = 0;
-        state.activeTurnStartedAt = Date.now();
-        state.triggeredThisTurn = [];
-        triggerQueue = [];
-
-        updateExtensionPrompt();
-        updateDiagnosticsPanel();
-
-        const selection = selectTargetsForEmptySendContinuation();
-
-        logVocaliaEvent('empty_send.continuation_targets', {
-            source,
-            reason: selection.reason,
-            sourceMessageId: selection.sourceMessageId ?? null,
-            targets: selection.targets.map(memberDebugSummary),
-        });
-
-        if (!selection.targets.length) {
-            globalThis.toastr?.warning(
-                'No eligible Vocalia continuation speaker found.',
-                MODULE_DISPLAY_NAME,
-            );
-
-            await saveMetadata();
-            updateDiagnosticsPanel();
-            return;
-        }
-
-        const sourceMessageId = Number.isInteger(Number(selection.sourceMessageId))
-            ? Number(selection.sourceMessageId)
-            : Math.max(0, (context.chat?.length ?? 1) - 1);
-
-        enqueueTriggers(selection.targets, sourceMessageId, selection.reason);
-
-        await saveMetadata();
-        updateDiagnosticsPanel();
-    } catch (error) {
-        warn('Empty Send continuation failed.', error);
-        errorToast(`Vocalia empty-send continuation failed: ${error?.message ?? error}`);
-
-        logVocaliaEvent('empty_send.error', {
-            source,
-            error,
-        }, { force: true });
-    } finally {
-        vocaliaEmptySendInProgress = false;
-    }
-}
-
-function interceptEmptySendEvent(event, source) {
-    if (!getSettings().enabled || !ctx().groupId) return false;
-
-    const text = getCurrentComposerText();
-    if (!isBlankText(text)) return false;
-
-    stopNativeSendEvent(event);
-
-    logVocaliaEvent('empty_send.intercepted', {
-        source,
-        chatLength: ctx().chat?.length ?? null,
-    }, { force: true });
-
-    void handleVocaliaEmptySendContinuation(source);
-
-    return true;
-}
-
-async function handleVocaliaControlledGeneration(action, clickedElement, source) {
+async function handleVocaliaControlledGeneration(action, clickedElement, source = 'unknown') {
     if (vocaliaControlledGenerationInProgress) {
-        logVocaliaEvent('controlled_generation.ignored_already_in_progress', {
+        logVocaliaEvent('controlled_generation.ignored', {
             action,
             source,
+            reason: 'already_in_progress',
         }, { force: true });
-
         return;
     }
 
-    if (queueRunning || hasPendingTriggerWaiters()) {
-        logVocaliaEvent('controlled_generation.ignored_generation_pending', {
+    if (hasPendingTriggerWaiters()) {
+        logVocaliaEvent('controlled_generation.blocked_pending_waiter', {
             action,
             source,
-            queueRunning,
             pendingTriggerWaiters: getPendingTriggerWaiterDebugSnapshot(),
         }, { force: true });
-
-        globalThis.toastr?.info(
-            'A Vocalia-triggered reply is still pending. Wait for it to finish before using Regenerate or Continue.',
-            MODULE_DISPLAY_NAME,
-        );
 
         return;
     }
@@ -5990,9 +5841,11 @@ async function handleVocaliaControlledGeneration(action, clickedElement, source)
         }
 
         const state = getChatState();
+        resetTurnResponseTracking?.(state);
         state.chainCount = 0;
         state.activeTurnStartedAt = Date.now();
         state.triggeredThisTurn = [];
+        state.participantResponseCountsThisTurn = {};
         triggerQueue = [];
 
         updateExtensionPrompt();
@@ -6008,17 +5861,24 @@ async function handleVocaliaControlledGeneration(action, clickedElement, source)
 
             const deleteOk = await deleteTailForVocaliaRegenerate(target.messageId);
             if (!deleteOk) {
+                clearControlledGenerationSession('controlled_regenerate_delete_refused');
                 await saveMetadata();
                 updateDiagnosticsPanel();
                 return;
             }
         }
 
+        createControlledGenerationSession(action, {
+            ...target,
+            messageId: sourceMessageId,
+        }, source);
+
         enqueueTriggers([target.member], sourceMessageId, target.reason);
 
         await saveMetadata();
         updateDiagnosticsPanel();
     } catch (error) {
+        clearControlledGenerationSession(`controlled_${action}_error`);
         warn(`Controlled ${action} failed.`, error);
         errorToast(`Vocalia ${action} failed: ${error?.message ?? error}`);
 
@@ -6045,6 +5905,7 @@ function interceptControlledGenerationEvent(event, source) {
     logVocaliaEvent('controlled_generation.intercepted', {
         action,
         source,
+        eventType: event.type,
         chatLength: ctx().chat?.length ?? null,
         clickedElementText: getElementActionText(clickable).slice(0, 500),
         clickedMessageId: getMessageIdFromDomElement(clickable),
@@ -6055,191 +5916,232 @@ function interceptControlledGenerationEvent(event, source) {
     return true;
 }
 
-function handleSendClickCapture(event) {
+function getSendButtonElement(element) {
+    if (!(element instanceof Element)) return null;
+
+    const directMatch = element.closest(VOCALIA_EMPTY_SEND_BUTTON_SELECTORS);
+    if (directMatch) return directMatch;
+
+    const clickable = getClickableActionElement(element);
+    if (!clickable) return null;
+
+    // Never classify the composer itself as a send control. Empty Send must be
+    // deliberate send intent, not focus/click/pointer activity in the textbox.
+    if (clickable.matches?.('#send_textarea') || clickable.closest?.('#send_textarea')) {
+        return null;
+    }
+
+    const haystack = getElementActionText(clickable);
+
+    if (/\b(send|send message|send_but|send-button)\b/i.test(haystack)) return clickable;
+    if (/fa-paper-plane/i.test(haystack)) return clickable;
+
+    return null;
+}
+
+function isSendButtonElement(element) {
+    return !!getSendButtonElement(element);
+}
+
+function isComposerElement(element) {
+    if (!(element instanceof Element)) return false;
+
+    return (
+        element.matches?.('#send_textarea')
+        || !!element.closest?.('#send_textarea')
+    );
+}
+
+function isPlainEnterSendIntent(event) {
+    if (!event || event.key !== 'Enter') return false;
+    if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return false;
+    if (event.isComposing) return false;
+
+    return true;
+}
+
+function isSendFormElement(element) {
+    if (!(element instanceof Element)) return false;
+
+    if (element.matches?.('#send_form, form') && element.querySelector?.('#send_textarea')) {
+        return true;
+    }
+
+    return false;
+}
+
+async function handleVocaliaEmptySend(source = 'unknown') {
+    if (vocaliaEmptySendInProgress) return;
+
+    vocaliaEmptySendInProgress = true;
+
+    try {
+        if (hasPendingTriggerWaiters()) {
+            globalThis.toastr?.warning(
+                'A Vocalia-triggered reply is still pending. Wait for it to finish before continuing.',
+                MODULE_DISPLAY_NAME,
+            );
+
+            logVocaliaEvent('empty_send.blocked_pending_waiter', {
+                source,
+                pendingTriggerWaiters: getPendingTriggerWaiterDebugSnapshot(),
+            }, { force: true });
+
+            return;
+        }
+
+        clearControlledGenerationSession('empty_send_new_continuation');
+
+        ensureStateForCurrentGroup();
+        await forceManualStrategyForCurrentGroup();
+
+        const continuation = selectTargetsForEmptySendContinuation();
+
+        logVocaliaEvent('empty_send.continuation_selected', {
+            source,
+            reason: continuation.reason,
+            targets: continuation.targets.map(memberDebugSummary),
+        }, { force: true });
+
+        if (!continuation.targets.length) {
+            globalThis.toastr?.warning(
+                'No eligible Vocalia continuation speaker found.',
+                MODULE_DISPLAY_NAME,
+            );
+
+            updateDiagnosticsPanel();
+            await saveMetadata();
+            return;
+        }
+
+        const state = getChatState();
+        resetTurnResponseTracking?.(state);
+        state.chainCount = 0;
+        state.activeTurnStartedAt = Date.now();
+        state.triggeredThisTurn = [];
+        state.participantResponseCountsThisTurn = {};
+        triggerQueue = [];
+
+        enqueueTriggers(
+            continuation.targets,
+            state.lastUserMessageId ?? Math.max(0, (ctx().chat?.length ?? 1) - 1),
+            continuation.reason,
+        );
+
+        await saveMetadata();
+        updateDiagnosticsPanel();
+    } catch (error) {
+        warn('Empty-send continuation failed.', error);
+        errorToast(`Vocalia continuation failed: ${error?.message ?? error}`);
+    } finally {
+        vocaliaEmptySendInProgress = false;
+    }
+}
+
+function interceptEmptySendEvent(event, source, options = {}) {
+    if (!getSettings().enabled || !ctx().groupId) return false;
+
+    const composerText = getCurrentComposerText();
+
+    if (!isBlankText(composerText)) return false;
+
+    const hasExplicitSendIntent = !!(
+        options.sendButton
+        || options.formSubmit
+        || options.composerEnter
+    );
+
+    if (!hasExplicitSendIntent) {
+        logVocaliaEvent('empty_send.ignored_no_send_intent', {
+            source,
+            eventType: event?.type ?? null,
+            targetText: event?.target instanceof Element ? getElementActionText(event.target).slice(0, 300) : null,
+        });
+
+        return false;
+    }
+
+    stopNativeSendEvent(event);
+    void handleVocaliaEmptySend(source);
+
+    return true;
+}
+
+function handleVocaliaControlledGenerationCapture(event) {
+    interceptControlledGenerationEvent(event, `document_${event.type}_capture`);
+}
+
+function handleVocaliaSendButtonClickCapture(event) {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
 
-    if (interceptControlledGenerationEvent(event, 'document_click_capture')) return;
-
-    const sendButton = target.closest('#send_but, .send_but');
+    const sendButton = getSendButtonElement(target);
     if (!sendButton) return;
 
-    if (interceptEmptySendEvent(event, 'send_button_click')) return;
-
-    // Typed user sends are allowed, even when no one is present.
-    blockTypedSendEvent(event, 'send_button_click');
+    interceptEmptySendEvent(event, 'send_button_click', {
+        sendButton,
+    });
 }
 
-function handleSendSubmitCapture(event) {
+function handleVocaliaSendSubmitCapture(event) {
     const target = event.target instanceof Element ? event.target : null;
-    if (!target) return;
+    if (!isSendFormElement(target)) return;
 
-    if (!target.matches('#send_form, form')) return;
-    if (!target.querySelector?.('#send_textarea')) return;
-
-    if (interceptEmptySendEvent(event, 'send_form_submit')) return;
-
-    // Typed user sends are allowed, even when no one is present.
-    blockTypedSendEvent(event, 'send_form_submit');
+    interceptEmptySendEvent(event, 'send_form_submit', {
+        formSubmit: target,
+    });
 }
 
-function handleSendKeydownCapture(event) {
+function handleVocaliaComposerKeydownCapture(event) {
     const target = event.target instanceof Element ? event.target : null;
-    if (!target) return;
+    if (!isComposerElement(target)) return;
+    if (!isPlainEnterSendIntent(event)) return;
 
-    const isComposer = target.matches('#send_textarea') || !!target.closest('#send_textarea');
-    if (!isComposer) return;
-
-    if (event.key !== 'Enter') return;
-    if (event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
-
-    if (interceptEmptySendEvent(event, 'composer_enter_key')) return;
-
-    // Typed user sends are allowed, even when no one is present.
-    blockTypedSendEvent(event, 'composer_enter_key');
+    interceptEmptySendEvent(event, 'composer_enter_key', {
+        composerEnter: true,
+    });
 }
 
 function installSendGuard() {
     if (vocaliaSendGuardInstalled) return;
 
-    document.addEventListener('click', handleSendClickCapture, true);
-    document.addEventListener('submit', handleSendSubmitCapture, true);
-    document.addEventListener('keydown', handleSendKeydownCapture, true);
+    for (const eventName of VOCALIA_CONTROLLED_GENERATION_GUARD_EVENTS) {
+        document.addEventListener(eventName, handleVocaliaControlledGenerationCapture, true);
+    }
+
+    document.addEventListener('click', handleVocaliaSendButtonClickCapture, true);
+    document.addEventListener('submit', handleVocaliaSendSubmitCapture, true);
+    document.addEventListener('keydown', handleVocaliaComposerKeydownCapture, true);
 
     vocaliaSendGuardInstalled = true;
 
-    logVocaliaEvent('send_guard.installed', {}, { force: false });
+    logVocaliaEvent('send_guard.installed', {
+        installed: true,
+        controlledGenerationEvents: [...VOCALIA_CONTROLLED_GENERATION_GUARD_EVENTS],
+        emptySendEvents: ['click:send_button', 'submit:send_form', 'keydown:composer_enter'],
+    });
 }
 
 function uninstallSendGuard() {
     if (!vocaliaSendGuardInstalled) return;
 
-    document.removeEventListener('click', handleSendClickCapture, true);
-    document.removeEventListener('submit', handleSendSubmitCapture, true);
-    document.removeEventListener('keydown', handleSendKeydownCapture, true);
+    for (const eventName of VOCALIA_CONTROLLED_GENERATION_GUARD_EVENTS) {
+        document.removeEventListener(eventName, handleVocaliaControlledGenerationCapture, true);
+    }
+
+    document.removeEventListener('click', handleVocaliaSendButtonClickCapture, true);
+    document.removeEventListener('submit', handleVocaliaSendSubmitCapture, true);
+    document.removeEventListener('keydown', handleVocaliaComposerKeydownCapture, true);
 
     vocaliaSendGuardInstalled = false;
     vocaliaEmptySendInProgress = false;
     vocaliaControlledGenerationInProgress = false;
 
-    logVocaliaEvent('send_guard.uninstalled', {}, { force: false });
-}
-
-function getWaitingForUserTarget(state) {
-    if (!state.waitingForUserByAvatar) return null;
-
-    const waitingMember = getMemberByAvatar(state.waitingForUserByAvatar);
-
-    logVocaliaEvent('user_turn.continuation.waiting_candidate', {
-        waitingForUserByAvatar: state.waitingForUserByAvatar,
-        waitingMember: memberDebugSummary(waitingMember),
-        eligible: isMemberInRouteEligibleList(waitingMember, getRouteEligibleMembersCompat()) && !waitingMember?.disabled,
+    logVocaliaEvent('send_guard.uninstalled', {
+        installed: false,
+        controlledGenerationEvents: [...VOCALIA_CONTROLLED_GENERATION_GUARD_EVENTS],
+        emptySendEvents: ['click:send_button', 'submit:send_form', 'keydown:composer_enter'],
     });
-
-    if (waitingMember && !waitingMember.disabled && isMemberInRouteEligibleList(waitingMember, getRouteEligibleMembersCompat())) {
-        return waitingMember;
-    }
-
-    return null;
-}
-
-function selectContinuationTargetsForUserMessage(userMessageId, state) {
-    const userText = getMessageText(userMessageId);
-    const selected = [];
-
-    const namedEligibleMembers = findMentionedPresentMembers(userText);
-    if (namedEligibleMembers.length) {
-        logVocaliaEvent('user_turn.continuation.name_match', {
-            userMessageId,
-            userText,
-            matchedMembers: namedEligibleMembers.map(memberDebugSummary),
-        });
-
-        selected.push(...namedEligibleMembers);
-    }
-
-    const summonedTargets = applyUserSummonBootstrap(userMessageId, userText);
-    if (summonedTargets.length) {
-        logVocaliaEvent('user_turn.continuation.user_summon_bootstrap', {
-            userMessageId,
-            userText,
-            targets: summonedTargets.map(memberDebugSummary),
-        });
-
-        selected.push(...summonedTargets);
-    }
-
-    const explicitTargets = limitTriggerTargets(selected);
-    if (explicitTargets.length) {
-        return {
-            reason: 'explicit-user-address-or-summon',
-            targets: explicitTargets,
-        };
-    }
-
-    const storedTargets = limitTriggerTargets(getStoredSpeakingToTargetsFromLastSpeaker());
-    if (storedTargets.length) {
-        return {
-            reason: 'last-speaker-stored-speaking-to-targets',
-            targets: storedTargets,
-        };
-    }
-
-    const waitingMember = getWaitingForUserTarget(state);
-    if (waitingMember) {
-        return {
-            reason: 'waiting-for-user',
-            targets: [waitingMember],
-        };
-    }
-
-    const priorAssistant = findMostRecentRouteEligibleAssistantBefore(userMessageId);
-    if (priorAssistant?.member) {
-        return {
-            reason: 'most-recent-route-eligible-prior-assistant',
-            targets: [priorAssistant.member],
-        };
-    }
-
-    if (state.lastSpeakerAvatar) {
-        const lastSpeaker = getMemberByAvatar(state.lastSpeakerAvatar);
-
-        if (lastSpeaker && !lastSpeaker.disabled && isMemberInRouteEligibleList(lastSpeaker, getRouteEligibleMembersCompat())) {
-            return {
-                reason: 'last-route-eligible-speaker-continuation',
-                targets: [lastSpeaker],
-            };
-        }
-    }
-
-    const latestEligibleMembers = getRouteEligibleMembersCompat();
-
-    if (latestEligibleMembers.length === 1) {
-        return {
-            reason: 'sole-route-eligible-member-continuation',
-            targets: [latestEligibleMembers[0]],
-        };
-    }
-
-    if (getSettings().firstMessageFallback === FIRST_MESSAGE_FALLBACK_RANDOM_PRESENT && latestEligibleMembers.length) {
-        const randomMember = randomItem(latestEligibleMembers);
-        return {
-            reason: 'random-route-eligible-continuation-fallback',
-            targets: randomMember ? [randomMember] : [],
-        };
-    }
-
-    if (getSettings().firstMessageFallback === FIRST_MESSAGE_FALLBACK_FIRST_PRESENT && latestEligibleMembers.length) {
-        return {
-            reason: 'first-route-eligible-continuation-fallback',
-            targets: latestEligibleMembers.slice(0, 1),
-        };
-    }
-
-    return {
-        reason: 'no-continuation-target',
-        targets: [],
-    };
 }
 
 async function handleUserMessage(eventValue) {
@@ -6250,6 +6152,8 @@ async function handleUserMessage(eventValue) {
         settingsEnabled: settings.enabled,
         groupId: ctx().groupId,
     });
+
+    clearControlledGenerationSession('new_user_message');
 
     if (!settings.enabled) return;
 
@@ -6265,8 +6169,6 @@ async function handleUserMessage(eventValue) {
     const state = ensureStateForCurrentGroup();
     const userText = getMessageText(userMessageId);
 
-    recordWitnessesForUserMessage(userMessageId, 'message_sent_user');
-
     logVocaliaEvent('user_turn.start', {
         userMessageId,
         message: getMessageDebugSummary(userMessageId),
@@ -6278,13 +6180,16 @@ async function handleUserMessage(eventValue) {
     state.activeTurnStartedAt = Date.now();
     state.pendingArrivals = [];
     state.triggeredThisTurn = [];
+    state.participantResponseCountsThisTurn = {};
     triggerQueue = [];
 
-    applyUserDepartureBootstrap(userMessageId, userText);
+    recordWitnessesForUserMessage(userMessageId, 'user_message_sent');
 
     await forceManualStrategyForCurrentGroup();
     updateExtensionPrompt();
     updateDiagnosticsPanel();
+
+    applyUserDepartureBootstrap(userMessageId, userText);
 
     const assistantMessagesBefore = getAssistantMessagesBefore(userMessageId);
     const isOpeningUserMessage = assistantMessagesBefore.length === 0;
@@ -6330,47 +6235,6 @@ async function handleUserMessage(eventValue) {
     });
 }
 
-function releaseBlankMessageState(messageId, message, correlatedAttempt) {
-    const state = ensureStateForCurrentGroup();
-    const member = getMemberByName(message?.name, getGroupMembers());
-    const avatar = correlatedAttempt?.memberAvatar ?? member?.avatar ?? null;
-
-    if (!avatar) return;
-
-    unmarkTriggeredThisTurn(avatar, correlatedAttempt ? 'blank_message_correlated_to_trigger_attempt' : 'blank_message_from_member');
-
-    if (state.waitingForUserByAvatar === avatar) {
-        state.waitingForUserByAvatar = null;
-    }
-
-    if (state.lastSpeakerAvatar === avatar) {
-        state.lastSpeakerAvatar = null;
-    }
-
-    if (state.members?.[avatar]) {
-        state.members[avatar].lastStatus = MEMBER_STATUS_IDLE;
-        state.members[avatar].speakingTo = [];
-        state.members[avatar].lastBlankMessageId = messageId;
-        state.members[avatar].lastBlankMessageAt = Date.now();
-    }
-
-    state.chainCount = Math.max(0, Number(state.chainCount || 0) - 1);
-
-    scrubStaleRoutingReferences(state, getGroupMembers());
-
-    logVocaliaEvent('assistant_message.blank_released_state', {
-        messageId,
-        releasedAvatar: avatar,
-        releasedName: avatarToDebugName(avatar),
-        correlatedAttempt: correlatedAttempt ?? null,
-        adjustedChainCount: state.chainCount,
-        waitingForUserByAvatar: state.waitingForUserByAvatar,
-        lastSpeakerAvatar: state.lastSpeakerAvatar,
-    });
-
-    saveMetadata();
-}
-
 function handleBlankAssistantMessage(messageId, message) {
     const correlatedAttempt = findRecentTriggerAttemptForMessage(message, messageId);
 
@@ -6381,18 +6245,27 @@ function handleBlankAssistantMessage(messageId, message) {
         correlatedRecentVocaliaTriggerAttempt: correlatedAttempt,
         conclusion: correlatedAttempt
             ? 'Blank message may have resulted from a recent Vocalia trigger attempt.'
-            : 'No recent Vocalia trigger attempt matched this blank message; stale state will still be scrubbed for this member.',
+            : 'No recent Vocalia trigger attempt matched this blank message; likely native/manual/pending SillyTavern generation or an in-flight generation from before logging began.',
     });
 
-    releaseBlankMessageState(messageId, message, correlatedAttempt);
-    updateDiagnosticsPanel();
+    if (correlatedAttempt?.memberAvatar) {
+        unmarkTriggeredThisTurn(correlatedAttempt.memberAvatar, 'blank_message_correlated_to_trigger_attempt');
+        updateDiagnosticsPanel();
+        saveMetadata();
+    }
 }
 
-function shouldRefuseBypassRouting(message, ownerBlock, ownerMember, waiterResults) {
+function shouldRefuseBypassRouting(message, ownerBlock, ownerMember, waiterResults = []) {
     if (waiterResults.length) {
         return {
             refused: false,
-            reason: 'matched_vocalia_trigger_waiter',
+            reason: 'message_matched_vocalia_trigger_waiter',
+            messageOwner: getMessageOwnerMember(message),
+            ownerBlock,
+            ownerMember,
+            messageOwnerEligible: true,
+            structuredOwnerEligible: true,
+            ownerMismatch: false,
         };
     }
 
@@ -6455,6 +6328,7 @@ function warnBypassRoutingRefused(messageId, bypassDecision) {
     logVocaliaEvent('assistant_message.native_bypass_routing_refused', {
         messageId,
         reason: bypassDecision.reason,
+        session: bypassDecision.session ?? null,
         messageOwner: memberDebugSummary(bypassDecision.messageOwner),
         ownerBlockName: bypassDecision.ownerBlock?.name ?? null,
         structuredOwner: memberDebugSummary(bypassDecision.ownerMember),
@@ -6523,6 +6397,7 @@ async function handleMessageReceived(eventValue) {
             parametersText: block.parametersText,
             parameterMeta: block.parameterMeta ?? null,
             segmentTypes: (block.segments ?? []).map(segment => segment.type),
+            segmentRepairs: block.segmentRepairs ?? [],
         })),
     });
 
@@ -6534,7 +6409,8 @@ async function handleMessageReceived(eventValue) {
         return;
     }
 
-    const firstAssistantForUserMessage = Number(getChatState().assistantCountSinceUser || 0) === 0;
+    const assistantCountSinceUserBeforeMessage = Math.max(0, getAssistantCountSinceLatestUserFromChat(messageId) - 1);
+    const firstAssistantForUserMessage = assistantCountSinceUserBeforeMessage === 0;
     const ownerBlock = firstValidOwnerBlock(blocks, message);
     const ownerMember = getMemberByName(ownerBlock?.name, getGroupMembers());
 
@@ -6543,6 +6419,7 @@ async function handleMessageReceived(eventValue) {
     logVocaliaEvent('assistant_message.owner_resolved', {
         messageId,
         messageName: message.name,
+        assistantCountSinceUserBeforeMessage,
         firstAssistantForUserMessage,
         ownerBlock: ownerBlock ? {
             name: ownerBlock.name,
@@ -6553,20 +6430,43 @@ async function handleMessageReceived(eventValue) {
             arriving: ownerBlock.arriving,
             remote: ownerBlock.remote ?? [],
             segmentTypes: (ownerBlock.segments ?? []).map(segment => segment.type),
+            segmentRepairs: ownerBlock.segmentRepairs ?? [],
         } : null,
         ownerMember: memberDebugSummary(ownerMember),
         waiterResults: waiterResults.map(result => ({
             status: result.status,
             attemptId: result.attempt?.id ?? null,
             memberName: result.attempt?.memberName ?? null,
+            reason: result.attempt?.reason ?? null,
         })),
     });
+
+    noteControlledGenerationAcceptedMessage(messageId, message, waiterResults);
+
+    const extraControlledGenerationDecision = shouldRefuseExtraControlledGenerationMessage(
+        messageId,
+        message,
+        ownerBlock,
+        ownerMember,
+        waiterResults,
+    );
+
+    if (extraControlledGenerationDecision.refused) {
+        renderMessageOverlay(messageId);
+        warnBypassRoutingRefused(messageId, extraControlledGenerationDecision);
+        syncAssistantCountSinceUserFromChat(messageId, 'extra_controlled_generation_refused');
+        updateDiagnosticsPanel();
+        await saveMetadata();
+        maybeApplyDeferredArrivalsAtChainEnd();
+        return;
+    }
 
     const bypassDecision = shouldRefuseBypassRouting(message, ownerBlock, ownerMember, waiterResults);
 
     if (bypassDecision.refused) {
         renderMessageOverlay(messageId);
         warnBypassRoutingRefused(messageId, bypassDecision);
+        syncAssistantCountSinceUserFromChat(messageId, 'bypass_routing_refused');
         updateDiagnosticsPanel();
         await saveMetadata();
         maybeApplyDeferredArrivalsAtChainEnd();
@@ -6622,9 +6522,16 @@ async function handleChatChanged() {
         groupId: ctx().groupId,
     });
 
+    clearControlledGenerationSession('chat_changed');
+
+    triggerQueue = [];
+    queueRunning = false;
+
     if (!getSettings().enabled) return;
 
     ensureStateForCurrentGroup();
+    syncAssistantCountSinceUserFromChat(null, 'chat_changed');
+
     await forceManualStrategyForCurrentGroup();
     updateExtensionPrompt();
     applyOverlaySettingToVisibleMessages();
@@ -6643,6 +6550,8 @@ async function handleGroupUpdated() {
     if (!getSettings().enabled) return;
 
     ensureStateForCurrentGroup();
+    syncAssistantCountSinceUserFromChat(null, 'group_updated');
+
     await forceManualStrategyForCurrentGroup();
     updateExtensionPrompt();
     updateDiagnosticsPanel();
@@ -6652,19 +6561,15 @@ async function handleGroupUpdated() {
 }
 
 // ============================================================================
-// Section 15. Settings UI, Diagnostics, and Styling
+// Section 17. Settings UI Constants, Help Text, and Styles
 // ============================================================================
 // Purpose:
-// - Build the Aspect: Vocalia extension drawer.
-// - Bind drawer controls to persistent settings.
-// - Display and manually edit active group member routing status.
-// - Display per-turn trigger allowances for debugging.
-// - Move large Status and Debug Log controls into viewport-constrained popups.
-// - Provide reference-style viewport-constrained info tooltips.
-// - Keep tooltip icons visually attached to wrapped label text.
+// - Own drawer metadata, tooltip help text, and CSS injection.
+// - Keep visual styling centralized.
+// - Style section headers as full-width black bars.
+// - Right-align number inputs.
+// - Support viewport-constrained popups and tooltips.
 // - Style semantic overlay nodes without using Markdown as the structure layer.
-// - Allow selected segments to opt into SillyTavern's own quote/asterisk styling.
-// - Pull footer version and author from manifest.json.
 // ============================================================================
 
 const VOCALIA_DEFAULT_MANIFEST_META = Object.freeze({
@@ -6680,7 +6585,6 @@ const VOCALIA_LABEL_HELP = Object.freeze({
     runtime: 'Controls how Vocalia integrates with SillyTavern group generation and speaker routing.',
     auto_manual: 'Automatically changes the active group reply strategy to Manual while Vocalia is enabled, preventing native random group speaker selection.',
     restore_strategy: 'Restores the group reply strategy Vocalia found before it changed the group to Manual.',
-    recall_presence: 'When enabled, Vocalia filters prompt history so a character only recalls messages they witnessed while present or remotely connected.',
 
     turn_flow: 'Controls how many group members may participate after one user message and how Vocalia selects first-turn speakers.',
     arrival_mode: 'Controls whether arriving characters become present immediately or after the current automatic response chain ends.',
@@ -6705,6 +6609,9 @@ const VOCALIA_LABEL_HELP = Object.freeze({
     prompt_depth: 'Depth where Vocalia protocol instructions are injected into the prompt.',
     hide_debug_toasts: 'Suppresses non-critical Vocalia debug toasts.',
 
+    memory: 'Controls what conversation history a character can recall based on whether they were present or remotely connected when messages occurred.',
+    recall_presence: 'When enabled, Vocalia filters prompt history so a character only recalls messages they witnessed while present or remotely connected.',
+
     status_section: 'Opens scene status diagnostics. Present means physically in-scene. Remote means active phone, radio, video, or text contact. Absent means neither present nor remotely connected.',
     status_popup: 'Shows current scene arrays and lets you manually adjust each group member’s Vocalia status for testing or correction.',
     status_arrays: 'Current Vocalia scene arrays for the active group chat.',
@@ -6728,18 +6635,14 @@ function injectStyles() {
     styleElement = document.createElement('style');
     styleElement.id = 'aspect_vocalia_styles';
     styleElement.textContent = `
-        #aspect_vocalia_settings small {
-            opacity: 0.8;
-            line-height: 1.35;
-        }
+        #aspect_vocalia_settings small { opacity: 0.8; line-height: 1.35; }
 
         #aspect_vocalia_settings input[type="number"] {
             max-width: 8em;
+            text-align: right;
         }
 
-        #aspect_vocalia_settings select {
-            max-width: 18em;
-        }
+        #aspect_vocalia_settings select { max-width: 18em; }
 
         #aspect_vocalia_settings .checkbox_label {
             align-items: flex-start;
@@ -6767,12 +6670,12 @@ function injectStyles() {
         }
 
         #aspect_vocalia_settings .aspect-vocalia-settings-section {
-            padding: 10px 0;
-            border-top: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15));
+            position: relative;
+            padding: 12px 0 10px;
+            border-top: none;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-settings-section:first-of-type {
-            border-top: none;
             padding-top: 0;
         }
 
@@ -6785,14 +6688,30 @@ function injectStyles() {
             line-height: 1.25;
         }
 
-        #aspect_vocalia_settings .aspect-vocalia-section-title,
+        #aspect_vocalia_settings .aspect-vocalia-section-title {
+            display: block;
+            box-sizing: border-box;
+            width: 100%;
+            font-weight: 700;
+            margin: 0 0 10px;
+            padding: 6px 10px;
+            border: 0;
+            border-radius: 4px;
+            background: #000;
+            color: #fff;
+            box-shadow: none;
+            letter-spacing: 0.01em;
+            opacity: 1;
+        }
+
         #aspect_vocalia_settings .aspect-vocalia-popup-title {
             display: inline-block;
         }
 
-        #aspect_vocalia_settings .aspect-vocalia-section-title {
-            font-weight: 700;
-            margin-bottom: 6px;
+        #aspect_vocalia_settings .aspect-vocalia-section-title .aspect-vocalia-info-trigger-text {
+            border-color: rgba(255,255,255,0.85);
+            background: #fff;
+            color: #111111;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-label,
@@ -6812,26 +6731,18 @@ function injectStyles() {
             background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.08));
         }
 
-        #aspect_vocalia_settings .aspect-vocalia-critical-enable-row {
-            display: flex;
-            align-items: flex-start;
-            gap: 8px;
-            margin-bottom: 10px;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-critical-button-row {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-critical-actions,
+        #aspect_vocalia_settings .aspect-vocalia-critical-enable-row,
+        #aspect_vocalia_settings .aspect-vocalia-critical-button-row,
         #aspect_vocalia_settings .aspect-vocalia-button-row {
             display: flex;
             align-items: center;
             flex-wrap: wrap;
             gap: 8px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-enable-row {
+            align-items: flex-start;
+            margin-bottom: 10px;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-inline-unit {
@@ -6847,12 +6758,11 @@ function injectStyles() {
             flex: 0 0 auto;
         }
 
-        #aspect_vocalia_settings .aspect-vocalia-critical-actions button,
-        #aspect_vocalia_settings .aspect-vocalia-button-row button,
-        #aspect_vocalia_settings .aspect-vocalia-critical-button-row button {
-            white-space: nowrap;
+        #aspect_vocalia_settings button,
+        #aspect_vocalia_settings input[type="button"] {
             width: auto;
             min-width: max-content;
+            white-space: nowrap;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-popup-wrap {
@@ -6900,6 +6810,44 @@ function injectStyles() {
             width: min(520px, calc(100vw - 16px));
         }
 
+        #aspect_vocalia_protocol_popup.aspect-vocalia-popup-open {
+            width: min(760px, calc(100vw - 16px));
+        }
+
+        #aspect_vocalia_protocol_popup .aspect-vocalia-protocol-field {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            padding: 8px;
+            border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.18));
+            border-radius: 8px;
+        }
+
+        #aspect_vocalia_protocol_popup .aspect-vocalia-protocol-field-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        #aspect_vocalia_protocol_popup .aspect-vocalia-protocol-textarea {
+            box-sizing: border-box;
+            width: 100%;
+            min-height: 4em;
+            resize: vertical;
+            font-family: var(--monoFontFamily, monospace);
+            font-size: 0.85em;
+            line-height: 1.35;
+            white-space: pre;
+        }
+
+        #aspect_vocalia_protocol_popup .aspect-vocalia-protocol-preview {
+            opacity: 0.75;
+            font-size: 0.85em;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
         #aspect_vocalia_member_state_table {
             width: 100%;
             border-collapse: collapse;
@@ -6919,10 +6867,7 @@ function injectStyles() {
             font-weight: 600;
         }
 
-        #aspect_vocalia_member_state_table .aspect-vocalia-member-name {
-            font-weight: 600;
-        }
-
+        #aspect_vocalia_member_state_table .aspect-vocalia-member-name { font-weight: 600; }
         #aspect_vocalia_member_state_table .aspect-vocalia-member-avatar {
             opacity: 0.7;
             font-size: 0.85em;
@@ -6936,7 +6881,8 @@ function injectStyles() {
             font-size: 0.9em;
         }
 
-        .aspect-vocalia-array-list code {
+        .aspect-vocalia-array-list code,
+        .aspect-vocalia-debug-status code {
             white-space: normal;
             word-break: break-word;
         }
@@ -6948,11 +6894,6 @@ function injectStyles() {
             border: 1px solid var(--SmartThemeBorderColor);
             border-radius: 6px;
             opacity: 0.95;
-        }
-
-        .aspect-vocalia-debug-status code {
-            white-space: normal;
-            word-break: break-word;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-footer-divider {
@@ -7017,12 +6958,6 @@ function injectStyles() {
             padding-top: 0.08em;
         }
 
-        #aspect_vocalia_settings .aspect-vocalia-info-trigger:hover,
-        #aspect_vocalia_settings .aspect-vocalia-info-trigger:focus-visible,
-        #aspect_vocalia_settings .aspect-vocalia-info-tooltip.is-open .aspect-vocalia-info-trigger {
-            opacity: 1;
-        }
-
         .aspect-vocalia-tooltip-layer {
             position: fixed;
             inset: 0;
@@ -7068,9 +7003,7 @@ function injectStyles() {
             transform: translate3d(0, 0, 0);
         }
 
-        #chat .mes[data-aspect-vocalia-rendered="true"] .mes_text {
-            display: block;
-        }
+        #chat .mes[data-aspect-vocalia-rendered="true"] .mes_text { display: block; }
 
         .aspect-vocalia-block {
             display: flex;
@@ -7078,50 +7011,18 @@ function injectStyles() {
             gap: 0.45em;
         }
 
-        .aspect-vocalia-block + .aspect-vocalia-block {
-            margin-top: 0.75em;
-        }
+        .aspect-vocalia-block + .aspect-vocalia-block { margin-top: 0.75em; }
+        .aspect-vocalia-character-label { font-weight: 700; }
+        .aspect-vocalia-segment { white-space: pre-wrap; }
+        .aspect-vocalia-segment-dialogue { font-style: normal; }
 
-        .aspect-vocalia-character-label {
-            font-weight: 700;
-        }
-
-        .aspect-vocalia-segment {
-            white-space: pre-wrap;
-        }
-
-        .aspect-vocalia-segment-dialogue {
-            font-style: normal;
-        }
-
-        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ITALIC}"] {
-            font-style: italic;
-        }
-
-        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_BOLD}"] {
-            font-weight: 700;
-        }
-
-        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_BOLD_ITALIC}"] {
-            font-weight: 700;
-            font-style: italic;
-        }
-
-        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_UNDERLINE}"] {
-            text-decoration: underline;
-        }
-
-        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_STRIKE}"] {
-            text-decoration: line-through;
-        }
-
-        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_UPPERCASE}"] {
-            text-transform: uppercase;
-        }
-
-        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_LOWERCASE}"] {
-            text-transform: lowercase;
-        }
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ITALIC}"] { font-style: italic; }
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_BOLD}"] { font-weight: 700; }
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_BOLD_ITALIC}"] { font-weight: 700; font-style: italic; }
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_UNDERLINE}"] { text-decoration: underline; }
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_STRIKE}"] { text-decoration: line-through; }
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_UPPERCASE}"] { text-transform: uppercase; }
+        .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_LOWERCASE}"] { text-transform: lowercase; }
 
         .aspect-vocalia-segment[data-display-style="muted"],
         .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ASTERISKS}"],
@@ -7133,29 +7034,13 @@ function injectStyles() {
             opacity: 0.88;
         }
 
-        .aspect-vocalia-segment[data-display-style="muted_bold"] {
-            font-weight: 700;
-        }
+        .aspect-vocalia-segment[data-display-style="muted_bold"] { font-weight: 700; }
+        .aspect-vocalia-segment[data-display-style="muted_underline"] { text-decoration: underline; }
+        .aspect-vocalia-segment[data-display-style="muted_strike"] { text-decoration: line-through; }
+        .aspect-vocalia-segment[data-display-style="muted_uppercase"] { text-transform: uppercase; }
+        .aspect-vocalia-segment[data-display-style="muted_lowercase"] { text-transform: lowercase; }
 
-        .aspect-vocalia-segment[data-display-style="muted_underline"] {
-            text-decoration: underline;
-        }
-
-        .aspect-vocalia-segment[data-display-style="muted_strike"] {
-            text-decoration: line-through;
-        }
-
-        .aspect-vocalia-segment[data-display-style="muted_uppercase"] {
-            text-transform: uppercase;
-        }
-
-        .aspect-vocalia-segment[data-display-style="muted_lowercase"] {
-            text-transform: lowercase;
-        }
-
-        .aspect-vocalia-segment-thoughts {
-            opacity: 0.92;
-        }
+        .aspect-vocalia-segment-thoughts { opacity: 0.92; }
 
         .aspect-vocalia-segment-thoughts[data-display-style="muted"],
         .aspect-vocalia-segment-thoughts[data-display-style="${OVERLAY_STYLE_ASTERISKS}"],
@@ -7167,40 +7052,35 @@ function injectStyles() {
             opacity: 0.78;
         }
 
-        .aspect-vocalia-formatted {
-            display: inline;
-        }
-
+        .aspect-vocalia-formatted,
         .aspect-vocalia-formatted p {
             display: inline;
             margin: 0;
             padding: 0;
         }
 
-        .aspect-vocalia-formatted p:first-child {
-            margin-top: 0;
-        }
+        .aspect-vocalia-formatted > :first-child,
+        .aspect-vocalia-formatted p:first-child { margin-top: 0; }
 
-        .aspect-vocalia-formatted p:last-child {
-            margin-bottom: 0;
-        }
-
-        .aspect-vocalia-formatted > :first-child {
-            margin-top: 0;
-        }
-
-        .aspect-vocalia-formatted > :last-child {
-            margin-bottom: 0;
-        }
+        .aspect-vocalia-formatted > :last-child,
+        .aspect-vocalia-formatted p:last-child { margin-bottom: 0; }
     `;
 
     document.head.appendChild(styleElement);
 }
 
+// ============================================================================
+// Section 18. Settings UI Manifest, Protocol Editor, and Tooltips
+// ============================================================================
+// Purpose:
+// - Load manifest metadata for the drawer footer.
+// - Render editable protocol-injection fields.
+// - Shield editable popup fields from global keyboard/clipboard handlers.
+// - Provide reference-style viewport-constrained info tooltips.
+// ============================================================================
+
 function getManifestAuthorName(author) {
-    if (typeof author === 'string') {
-        return author;
-    }
+    if (typeof author === 'string') return author;
 
     if (Array.isArray(author)) {
         return author
@@ -7242,6 +7122,128 @@ async function loadVocaliaManifestMetadata() {
 function renderVocaliaSettingsFooter() {
     $('#aspect_vocalia_settings_version').text(`Version ${vocaliaManifestMeta.version}`);
     $('#aspect_vocalia_settings_author').text(vocaliaManifestMeta.author);
+}
+
+function cssEscape(value) {
+    if (globalThis.CSS?.escape) return CSS.escape(String(value));
+    return String(value).replace(/["\\]/g, '\\$&');
+}
+
+function isVocaliaEditableElement(element) {
+    if (!element) return false;
+
+    return !!element.closest?.(
+        'textarea, input, select, [contenteditable="true"], [contenteditable="plaintext-only"]',
+    );
+}
+
+function shieldVocaliaPopupEditableEvents(rootElement) {
+    if (!rootElement || rootElement.dataset.editableEventShieldBound === 'true') return;
+
+    const shield = event => {
+        if (!isVocaliaEditableElement(event.target)) return;
+        event.stopPropagation();
+    };
+
+    for (const eventName of ['keydown', 'keyup', 'keypress', 'copy', 'cut', 'paste', 'selectstart']) {
+        rootElement.addEventListener(eventName, shield, true);
+        rootElement.addEventListener(eventName, shield, false);
+    }
+
+    rootElement.dataset.editableEventShieldBound = 'true';
+}
+
+function renderProtocolInjectionEditorFields() {
+    if (typeof getProtocolInstructionSectionDefinitions !== 'function') return '';
+
+    return getProtocolInstructionSectionDefinitions().map(definition => {
+        const key = escapeHtml(definition.key);
+        const label = escapeHtml(definition.label);
+        const value = escapeHtml(getProtocolInstructionTemplate(definition.key));
+        const rows = Math.max(2, Math.min(14, Number(definition.rows) || 5));
+        const preview = escapeHtml(getProtocolInstructionPreviewText(definition.key));
+
+        return `
+            <div class="aspect-vocalia-protocol-field" data-protocol-key="${key}">
+                <div class="aspect-vocalia-protocol-field-header">
+                    <label for="aspect_vocalia_protocol_${key}" class="aspect-vocalia-label">${label}</label>
+                    <button
+                        type="button"
+                        class="menu_button aspect-vocalia-protocol-reset"
+                        data-protocol-key="${key}"
+                    >Reset</button>
+                </div>
+                <textarea
+                    id="aspect_vocalia_protocol_${key}"
+                    class="text_pole aspect-vocalia-protocol-textarea"
+                    data-protocol-key="${key}"
+                    rows="${rows}"
+                    spellcheck="false"
+                >${value}</textarea>
+                <div class="aspect-vocalia-protocol-preview" data-protocol-preview="${key}">${preview}</div>
+            </div>`;
+    }).join('');
+}
+
+function updateProtocolInjectionPreview(key) {
+    if (!key || typeof getProtocolInstructionPreviewText !== 'function') return;
+
+    const preview = document.querySelector(`#aspect_vocalia_protocol_popup [data-protocol-preview="${cssEscape(key)}"]`);
+    if (!preview) return;
+
+    preview.textContent = getProtocolInstructionPreviewText(key);
+}
+
+function updateAllProtocolInjectionPreviews() {
+    if (typeof getProtocolInstructionSectionDefinitions !== 'function') return;
+
+    for (const definition of getProtocolInstructionSectionDefinitions()) {
+        updateProtocolInjectionPreview(definition.key);
+    }
+}
+
+function loadProtocolInjectionEditorUi() {
+    if (typeof getProtocolInstructionSectionDefinitions !== 'function') return;
+
+    for (const definition of getProtocolInstructionSectionDefinitions()) {
+        const textarea = document.querySelector(`#aspect_vocalia_protocol_popup textarea[data-protocol-key="${cssEscape(definition.key)}"]`);
+        if (textarea) textarea.value = getProtocolInstructionTemplate(definition.key);
+    }
+
+    updateAllProtocolInjectionPreviews();
+}
+
+function bindProtocolInjectionEditorUi() {
+    const root = $('#aspect_vocalia_protocol_popup');
+    if (!root.length || root.attr('data-protocol-bound') === 'true') return;
+
+    shieldVocaliaPopupEditableEvents(root[0]);
+
+    root.on('input change', '.aspect-vocalia-protocol-textarea', function () {
+        const key = String($(this).attr('data-protocol-key') ?? '');
+        if (!key) return;
+
+        setProtocolInstructionTemplate(key, $(this).val());
+        updateProtocolInjectionPreview(key);
+    });
+
+    root.on('click', '.aspect-vocalia-protocol-reset', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const key = String($(this).attr('data-protocol-key') ?? '');
+        if (!key) return;
+
+        const value = resetProtocolInstructionTemplate(key);
+        const textarea = root.find(`textarea[data-protocol-key="${cssEscape(key)}"]`).first();
+
+        textarea.val(value);
+        updateProtocolInjectionPreview(key);
+
+        globalThis.toastr?.success('Protocol section reset.', MODULE_DISPLAY_NAME);
+    });
+
+    root.attr('data-protocol-bound', 'true');
 }
 
 function renderVocaliaInfoTip(key, label = 'More information') {
@@ -7293,7 +7295,6 @@ function addVocaliaInfoTipsToSettings() {
     appendVocaliaInfoTip(findVocaliaLabelByText('Runtime'), 'runtime', 'Explain Runtime');
     appendVocaliaInfoTip(findVocaliaLabelByText('Change Group Reply Strategy to Manual Automatically'), 'auto_manual', 'Explain Manual Strategy');
     appendVocaliaInfoTip(findVocaliaLabelByText('Restore Original Group Reply Strategy Automatically'), 'restore_strategy', 'Explain Strategy Restore');
-    appendVocaliaInfoTip(findVocaliaLabelByText('Presence Required for Message Recall'), 'recall_presence', 'Explain Message Recall');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Turn Flow'), 'turn_flow', 'Explain Turn Flow');
     appendVocaliaInfoTip(findVocaliaLabelByText('Arrival Handling'), 'arrival_mode', 'Explain Arrival Handling');
@@ -7317,6 +7318,9 @@ function addVocaliaInfoTipsToSettings() {
     appendVocaliaInfoTip(findVocaliaLabelByText('Protocol'), 'protocol', 'Explain Protocol');
     appendVocaliaInfoTip(findVocaliaLabelByText('Protocol Injection Depth'), 'prompt_depth', 'Explain Protocol Depth');
     appendVocaliaInfoTip(findVocaliaLabelByText('Hide Debug Toasts'), 'hide_debug_toasts', 'Explain Debug Toasts');
+
+    appendVocaliaInfoTip(findVocaliaLabelByText('Memory'), 'memory', 'Explain Memory');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Presence Required for Message Recall'), 'recall_presence', 'Explain Message Recall');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Status', '.aspect-vocalia-section-title'), 'status_section', 'Explain Status');
     appendVocaliaInfoTip(findVocaliaLabelByText('Status', '#aspect_vocalia_status_popup .aspect-vocalia-popup-title'), 'status_popup', 'Explain Status Popup');
@@ -7419,9 +7423,7 @@ function setupVocaliaInfoTooltips() {
         }, 0);
 
         const { trigger, bubble } = getTooltipParts(tooltip);
-        if (trigger) {
-            trigger.setAttribute('aria-expanded', 'false');
-        }
+        if (trigger) trigger.setAttribute('aria-expanded', 'false');
 
         clearTooltipPosition(bubble);
     };
@@ -7527,6 +7529,16 @@ function setupVocaliaInfoTooltips() {
 
     root.dataset.infoTooltipsBound = 'true';
 }
+
+// ============================================================================
+// Section 19. Settings UI Diagnostics, Popups, and Display Helpers
+// ============================================================================
+// Purpose:
+// - Own popup positioning and diagnostics rendering.
+// - Render member status rows and scene arrays.
+// - Render overlay style options.
+// - Own inverted setting helpers and reset behavior.
+// ============================================================================
 
 function clampVocaliaNumber(value, min, max) {
     return Math.min(Math.max(value, min), max);
@@ -7711,13 +7723,10 @@ function renderOverlayStyleOptions(selectedStyle) {
         ['muted', 'Muted'],
 
         [OVERLAY_STYLE_BOLD, 'Bold'],
-		['muted_bold', 'Muted Bold'],
-		
         [OVERLAY_STYLE_ITALIC, 'Italics'],
-		[OVERLAY_STYLE_ASTERISKS, 'Muted Italics'],
-		
         [OVERLAY_STYLE_BOLD_ITALIC, 'Bold Italics'],
-        
+        ['muted_bold', 'Muted Bold'],
+        [OVERLAY_STYLE_ASTERISKS, 'Muted Italics'],
 
         [OVERLAY_STYLE_UNDERLINE, 'Underline'],
         ['muted_underline', 'Muted Underline'],
@@ -7904,6 +7913,16 @@ async function resetVocaliaExtension() {
     globalThis.toastr?.success('Aspect: Vocalia has been reset.', MODULE_DISPLAY_NAME);
 }
 
+// ============================================================================
+// Section 20. Settings Drawer Rendering and Binding
+// ============================================================================
+// Purpose:
+// - Build the Aspect: Vocalia drawer UI.
+// - Move Presence Required for Message Recall into its own Memory section.
+// - Keep Status popup button on its own line under the Status header.
+// - Bind all controls to settings, diagnostics, popups, and utilities.
+// ============================================================================
+
 function injectSettingsUi() {
     if ($('#aspect_vocalia_settings').length) return;
 
@@ -7992,11 +8011,6 @@ function injectSettingsUi() {
                             <label class="checkbox_label">
                                 <input id="av_restore_strategy" type="checkbox">
                                 <span class="aspect-vocalia-label-text">Restore Original Group Reply Strategy Automatically</span>
-                            </label>
-
-                            <label class="checkbox_label">
-                                <input id="av_occlude_history" type="checkbox">
-                                <span class="aspect-vocalia-label-text">Presence Required for Message Recall</span>
                             </label>
                         </div>
                     </div>
@@ -8098,6 +8112,22 @@ function injectSettingsUi() {
                         <div class="aspect-vocalia-section-title">Protocol</div>
 
                         <div class="flex-container flexFlowColumn">
+                            <span class="aspect-vocalia-popup-wrap">
+                                <button
+                                    id="av_protocol_popup_button"
+                                    type="button"
+                                    class="menu_button aspect-vocalia-popup-button"
+                                >
+                                    Protocol Injection
+                                </button>
+
+                                <div id="aspect_vocalia_protocol_popup" class="aspect-vocalia-popup">
+                                    <div class="aspect-vocalia-popup-title">Protocol Injection</div>
+                                    <div class="aspect-vocalia-protocol-preview">Edit the concise instruction templates Vocalia injects into the LLM prompt. Placeholders such as {{tagPrefix}}, {{allMembers}}, and {{maxParticipants}} are filled at generation time.</div>
+                                    ${renderProtocolInjectionEditorFields()}
+                                </div>
+                            </span>
+
                             <div class="flex-container alignItemsCenter">
                                 <label for="av_prompt_depth" class="flexGrow aspect-vocalia-label">Protocol Injection Depth</label>
                                 <input id="av_prompt_depth" class="text_pole widthUnset" type="number" min="0" max="100" step="1">
@@ -8111,51 +8141,64 @@ function injectSettingsUi() {
                     </div>
 
                     <div class="aspect-vocalia-settings-section">
+                        <div class="aspect-vocalia-section-title">Memory</div>
+
+                        <div class="flex-container flexFlowColumn">
+                            <label class="checkbox_label">
+                                <input id="av_occlude_history" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Presence Required for Message Recall</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="aspect-vocalia-settings-section">
                         <div class="aspect-vocalia-section-title">Status</div>
 
-                        <span class="aspect-vocalia-popup-wrap">
-                            <button
-                                id="av_status_popup_button"
-                                type="button"
-                                class="menu_button aspect-vocalia-popup-button"
-                            >
-                                Status
-                            </button>
+                        <div class="aspect-vocalia-button-row">
+                            <span class="aspect-vocalia-popup-wrap">
+                                <button
+                                    id="av_status_popup_button"
+                                    type="button"
+                                    class="menu_button aspect-vocalia-popup-button"
+                                >
+                                    Status
+                                </button>
 
-                            <div id="aspect_vocalia_status_popup" class="aspect-vocalia-popup">
-                                <div class="aspect-vocalia-popup-title">Status</div>
+                                <div id="aspect_vocalia_status_popup" class="aspect-vocalia-popup">
+                                    <div class="aspect-vocalia-popup-title">Status</div>
 
-                                <div class="aspect-vocalia-label aspect-vocalia-status-arrays-label">Scene arrays</div>
-                                <div class="aspect-vocalia-array-list">
-                                    <div>Present: <code id="aspect_vocalia_array_present">none</code></div>
-                                    <div>Remote: <code id="aspect_vocalia_array_remote">none</code></div>
-                                    <div>Idle: <code id="aspect_vocalia_array_idle">none</code></div>
-                                    <div>Arriving: <code id="aspect_vocalia_array_arriving">none</code></div>
-                                    <div>Departing: <code id="aspect_vocalia_array_departing">none</code></div>
-                                    <div>Absent: <code id="aspect_vocalia_array_absent">none</code></div>
-                                    <div>Triggered this user turn: <code id="aspect_vocalia_array_triggered">none</code></div>
+                                    <div class="aspect-vocalia-label aspect-vocalia-status-arrays-label">Scene arrays</div>
+                                    <div class="aspect-vocalia-array-list">
+                                        <div>Present: <code id="aspect_vocalia_array_present">none</code></div>
+                                        <div>Remote: <code id="aspect_vocalia_array_remote">none</code></div>
+                                        <div>Idle: <code id="aspect_vocalia_array_idle">none</code></div>
+                                        <div>Arriving: <code id="aspect_vocalia_array_arriving">none</code></div>
+                                        <div>Departing: <code id="aspect_vocalia_array_departing">none</code></div>
+                                        <div>Absent: <code id="aspect_vocalia_array_absent">none</code></div>
+                                        <div>Triggered this user turn: <code id="aspect_vocalia_array_triggered">none</code></div>
+                                    </div>
+
+                                    <div class="aspect-vocalia-label aspect-vocalia-status-members-label">Status Configuration</div>
+                                    <table id="aspect_vocalia_member_state_table">
+                                        <thead>
+                                            <tr>
+                                                <th>Participants</th>
+                                                <th>Enabled</th>
+                                                <th>Responses</th>
+                                                <th>Status</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody></tbody>
+                                    </table>
+
+                                    <div class="aspect-vocalia-button-row">
+                                        <span class="aspect-vocalia-control-with-tip aspect-vocalia-sync-tip-anchor">
+                                            <input id="av_sync_state" class="menu_button" type="button" value="Sync scene state from group">
+                                        </span>
+                                    </div>
                                 </div>
-
-                                <div class="aspect-vocalia-label aspect-vocalia-status-members-label">Status Configuration</div>
-                                <table id="aspect_vocalia_member_state_table">
-                                    <thead>
-                                        <tr>
-                                            <th>Participants</th>
-                                            <th>Enabled</th>
-                                            <th>Responses</th>
-                                            <th>Status</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody></tbody>
-                                </table>
-
-                                <div class="aspect-vocalia-button-row">
-                                    <span class="aspect-vocalia-control-with-tip aspect-vocalia-sync-tip-anchor">
-                                        <input id="av_sync_state" class="menu_button" type="button" value="Sync scene state from group">
-                                    </span>
-                                </div>
-                            </div>
-                        </span>
+                            </span>
+                        </div>
                     </div>
 
                     <div class="aspect-vocalia-settings-section">
@@ -8221,6 +8264,8 @@ function loadSettingsUi() {
     $('#av_prompt_depth').val(String(settings.promptDepth));
     $('#av_hide_debug_toasts').prop('checked', getDebugToastsHidden(settings));
 
+    loadProtocolInjectionEditorUi();
+
     updateDiagnosticsPanel();
     updateDebugLogUi();
     renderVocaliaSettingsFooter();
@@ -8281,7 +8326,6 @@ function bindSettingsUi() {
 
     bindCheckbox('#av_auto_manual', 'autoSetManual', async () => forceManualStrategyForCurrentGroup());
     bindCheckbox('#av_restore_strategy', 'restoreOriginalStrategyOnDisable');
-    bindCheckbox('#av_occlude_history', 'occludeUnwitnessedHistory');
 
     bindPlainSelect('#av_arrival_mode', 'arrivalApplyMode', async () => {
         if (getSettings().arrivalApplyMode === ARRIVAL_APPLY_IMMEDIATE) {
@@ -8332,6 +8376,8 @@ function bindSettingsUi() {
         setInvertedBooleanSetting('hideDebugToasts', 'showDebugToasts', !!$(this).prop('checked'));
     });
 
+    bindCheckbox('#av_occlude_history', 'occludeUnwitnessedHistory');
+
     $('#av_status_popup_button').on('click', function (event) {
         stopVocaliaPopupEvent(event);
         updateDiagnosticsPanel();
@@ -8342,6 +8388,12 @@ function bindSettingsUi() {
         stopVocaliaPopupEvent(event);
         updateDebugLogUi();
         toggleVocaliaPopup(this, '#aspect_vocalia_debug_popup');
+    });
+
+    $('#av_protocol_popup_button').on('click', function (event) {
+        stopVocaliaPopupEvent(event);
+        loadProtocolInjectionEditorUi();
+        toggleVocaliaPopup(this, '#aspect_vocalia_protocol_popup');
     });
 
     $('#aspect_vocalia_settings').on('click', '.aspect-vocalia-popup', function (event) {
@@ -8446,16 +8498,22 @@ function bindSettingsUi() {
         await resetVocaliaExtension();
     });
 
+    bindProtocolInjectionEditorUi();
     loadSettingsUi();
 }
 
 // ============================================================================
-// Section 16. Event Binding
+// Section 21. Event Binding
 // ============================================================================
 // Purpose:
 // - Register extension handlers with SillyTavern eventSource.
 // - Observe chat DOM changes for overlay rendering.
 // - Keep event binding separate from runtime enable/disable.
+// - Bind only true stop/abort lifecycle events to waiter interruption cleanup.
+// - Treat GENERATION_ENDED as observational only; it may fire before or near
+//   MESSAGE_RECEIVED and must not clear Vocalia waiters.
+// - Do not bind GENERATION_AFTER_COMMANDS to waiter cleanup; it is not a
+//   generation-finished/no-message signal.
 // ============================================================================
 
 function bindEvent(eventSource, eventTypes, eventName, handler) {
@@ -8469,6 +8527,24 @@ function bindEvent(eventSource, eventTypes, eventName, handler) {
     if (typeof eventSource.on === 'function') {
         eventSource.on(eventType, handler);
         return;
+    }
+
+    throw new Error('SillyTavern eventSource does not expose an .on() method.');
+}
+
+function bindOptionalEvent(eventSource, eventTypes, eventName, handler) {
+    const eventType = eventTypes?.[eventName];
+
+    if (!eventType) {
+        logVocaliaEvent('event.optional_unavailable', {
+            eventName,
+        });
+        return false;
+    }
+
+    if (typeof eventSource.on === 'function') {
+        eventSource.on(eventType, handler);
+        return true;
     }
 
     throw new Error('SillyTavern eventSource does not expose an .on() method.');
@@ -8488,6 +8564,17 @@ function bindEvents() {
     bindEvent(eventSource, eventTypes, 'CHARACTER_MESSAGE_RENDERED', handleMessageRendered);
     bindEvent(eventSource, eventTypes, 'CHAT_CHANGED', handleChatChanged);
     bindEvent(eventSource, eventTypes, 'GROUP_UPDATED', handleGroupUpdated);
+
+    bindOptionalEvent(eventSource, eventTypes, 'GENERATION_STOPPED', handleGenerationLifecycleStopped);
+
+    // GENERATION_ENDED is useful for diagnostics and harmless tail checks, but
+    // it must not resolve pending waiters as interrupted.
+    bindOptionalEvent(eventSource, eventTypes, 'GENERATION_ENDED', handleGenerationLifecycleEnded);
+
+    // Intentionally not bound:
+    // - GENERATION_AFTER_COMMANDS: before/around generation command handling, not
+    //   proof that generation failed or produced no message.
+    // - Ordinary GENERATION_ENDED cleanup: handled above as observation only.
 
     if (mutationObserver) {
         mutationObserver.disconnect();
@@ -8509,7 +8596,7 @@ function bindEvents() {
 }
 
 // ============================================================================
-// Section 17. Runtime Lifecycle
+// Section 22. Runtime Lifecycle
 // ============================================================================
 // Purpose:
 // - Enable, disable, and initialize Aspect: Vocalia safely.
