@@ -1,5 +1,7 @@
 # Aspect: Vocalia
 
+<img src="https://github.com/Vectricity/st-aspect-destinia/raw/assets/assets/thumbnail_vocalia.png" alt="Thumbnail of Vocalia" width="400">
+
 Aspect: Vocalia is a SillyTavern extension for intelligently automating character responses in group chats.
 
 ## What It Does
