@@ -1,10 +1,11 @@
 {
   "display_name": "Aspect: Vocalia",
-  "loading_order": 1,
+  "loading_order": 1000,
+  "generate_interceptor": "aspectVocaliaGenerateInterceptor",
   "requires": [],
   "optional": [],
   "js": "index.js",
   "author": "Genisai",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "homePage": "https://github.com/Vectricity/st-aspect-vocalia"
 }
