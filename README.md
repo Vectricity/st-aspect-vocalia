@@ -37,6 +37,8 @@ Examples of user-side signals Vocalia can recognize include:
 Uses a structured assistant-response format so the active speaker, visible roleplay content, and routing metadata remain separate.
 
 Assistant messages are structured as follows:
+
+```json
     [character=Exact Active Speaker Name]
     [dialogue]spoken words only[end dialogue]
     [actions]active speaker physical action, expression, or gesture only[end actions]
@@ -44,6 +46,7 @@ Assistant messages are structured as follows:
     [thoughts]active speaker private thought only[end thoughts]
     [parameters]speakingTo=ExactName|user|none, participationNextTurn=speak|idle|departing, arriving=ExactName|none, remote=ExactName|none[end parameters]
     [end character]
+```
 	
 ## Refined Messages
 
