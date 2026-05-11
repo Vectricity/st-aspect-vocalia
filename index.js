@@ -5613,17 +5613,17 @@ const VOCALIA_CONTROLLED_GENERATION_GUARD_EVENTS = Object.freeze([
     'touchstart',
 ]);
 
-const VOCALIA_EMPTY_SEND_BUTTON_SELECTORS = [
+const VOCALIA_NATIVE_SEND_FORM_SELECTOR = '#send_form';
+const VOCALIA_NATIVE_COMPOSER_SELECTOR = '#send_textarea';
+
+const VOCALIA_NATIVE_SEND_BUTTON_ID_SELECTORS = [
     '#send_but',
     '#send_button',
+].join(',');
+
+const VOCALIA_NATIVE_SEND_BUTTON_CLASS_SELECTORS = [
     '.send_but',
     '.send_button',
-    '[data-i18n="[title]Send"]',
-    '[data-i18n="Send"]',
-    '[title="Send"]',
-    '[title="Send message"]',
-    '[aria-label="Send"]',
-    '[aria-label="Send message"]',
 ].join(',');
 
 function isMemberInRouteEligibleList(member, eligibleMembers = getRouteEligibleMembersCompat()) {
@@ -6829,25 +6829,36 @@ function interceptControlledGenerationEvent(event, source) {
     return true;
 }
 
+function getNativeSendFormElement() {
+    return document.querySelector(VOCALIA_NATIVE_SEND_FORM_SELECTOR);
+}
+
+function isWithinNativeSendForm(element) {
+    if (!(element instanceof Element)) return false;
+
+    const form = getNativeSendFormElement();
+    return !!form && (element === form || form.contains(element));
+}
+
+function isNativeComposerElement(element) {
+    if (!(element instanceof Element)) return false;
+
+    return (
+        element.matches?.(VOCALIA_NATIVE_COMPOSER_SELECTOR)
+        || !!element.closest?.(VOCALIA_NATIVE_COMPOSER_SELECTOR)
+    );
+}
+
 function getSendButtonElement(element) {
     if (!(element instanceof Element)) return null;
 
-    const directMatch = element.closest(VOCALIA_EMPTY_SEND_BUTTON_SELECTORS);
-    if (directMatch) return directMatch;
+    const nativeForm = getNativeSendFormElement();
 
-    const clickable = getClickableActionElement(element);
-    if (!clickable) return null;
+    const idButton = element.closest(VOCALIA_NATIVE_SEND_BUTTON_ID_SELECTORS);
+    if (idButton && (!nativeForm || isWithinNativeSendForm(idButton))) return idButton;
 
-    // Never classify the composer itself as a send control. Empty Send must be
-    // deliberate send intent, not focus/click/pointer activity in the textbox.
-    if (clickable.matches?.('#send_textarea') || clickable.closest?.('#send_textarea')) {
-        return null;
-    }
-
-    const haystack = getElementActionText(clickable);
-
-    if (/\b(send|send message|send_but|send-button)\b/i.test(haystack)) return clickable;
-    if (/fa-paper-plane/i.test(haystack)) return clickable;
+    const classButton = element.closest(VOCALIA_NATIVE_SEND_BUTTON_CLASS_SELECTORS);
+    if (classButton && isWithinNativeSendForm(classButton)) return classButton;
 
     return null;
 }
@@ -6857,12 +6868,7 @@ function isSendButtonElement(element) {
 }
 
 function isComposerElement(element) {
-    if (!(element instanceof Element)) return false;
-
-    return (
-        element.matches?.('#send_textarea')
-        || !!element.closest?.('#send_textarea')
-    );
+    return isNativeComposerElement(element);
 }
 
 function isPlainEnterSendIntent(event) {
@@ -6876,11 +6882,8 @@ function isPlainEnterSendIntent(event) {
 function isSendFormElement(element) {
     if (!(element instanceof Element)) return false;
 
-    if (element.matches?.('#send_form, form') && element.querySelector?.('#send_textarea')) {
-        return true;
-    }
-
-    return false;
+    const form = getNativeSendFormElement();
+    return !!form && element === form;
 }
 
 async function handleVocaliaEmptySend(source = 'unknown') {
