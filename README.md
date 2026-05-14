@@ -64,7 +64,7 @@ Their appearance can be adjusted by:
 - showing or hiding character label
 - showing or hiding thoughts
 - wrapping dialogue in quotes
-- styling actions, narration, and thoughts separately
+- styling actions, narration, dialogue, and thoughts separately
 
 ## Turn Flow
 
@@ -75,6 +75,7 @@ It can:
 - Limit how many unique characters participate after one user message
 - Limit how many total assistant messages may occur after one user message
 - Limit how many times the same participant may respond during that turn
+- Triggers assistant turn automatically and contextually, or manually if preferred
 
 ## Message Memory
 

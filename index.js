@@ -98,6 +98,12 @@ const DEFAULT_SETTINGS = Object.freeze({
     useSlashTrigger: true,
     fallbackToInternalGenerate: true,
 
+    // When enabled, Vocalia automatically selects and triggers speakers after
+    // normal user messages and participationNextTurn=speak metadata. When
+    // disabled, /trigger and empty-send continuation remain available for
+    // manual speaker flow.
+    autoTurnFlow: true,
+
     maxParticipantsPerTurn: 6,
     maxResponsesPerTurn: 6,
     maxResponsesPerParticipantPerTurn: 1,
@@ -115,9 +121,15 @@ const DEFAULT_SETTINGS = Object.freeze({
     hideThoughtsInRefinedMessage: true,
     quoteDialogue: true,
 
+    dialogueDisplayStyle: OVERLAY_STYLE_PLAIN,
     actionDisplayStyle: OVERLAY_STYLE_ITALIC,
     narrationDisplayStyle: OVERLAY_STYLE_PLAIN,
     thoughtsDisplayStyle: OVERLAY_STYLE_ASTERISKS,
+
+    dialogueTextColor: '',
+    actionTextColor: '',
+    narrationTextColor: '',
+    thoughtsTextColor: '',
 
     promptDepth: 0,
     promptRole: EXTENSION_PROMPT_ROLE_SYSTEM,
@@ -161,6 +173,10 @@ let queueRunning = false;
 let triggerQueue = [];
 let mutationObserver = null;
 let styleElement = null;
+let vocaliaManifestMeta = {
+    version: '0.0.0',
+    author: 'Genisai',
+};
 
 let vocaliaDebugActive = false;
 let vocaliaDebugStartedAt = null;
@@ -307,6 +323,18 @@ function migrateRenamedSettings(settings) {
     settings.maxResponsesPerParticipantPerTurn = clampInteger(settings.maxResponsesPerParticipantPerTurn, 1, 3, DEFAULT_SETTINGS.maxResponsesPerParticipantPerTurn);
     settings.triggerDelayMs = Math.round(clampNumber(settings.triggerDelayMs, 0, 10000, DEFAULT_SETTINGS.triggerDelayMs));
 
+    settings.autoTurnFlow = settings.autoTurnFlow !== false;
+
+    settings.dialogueDisplayStyle = normalizeOverlayStyle(settings.dialogueDisplayStyle ?? DEFAULT_SETTINGS.dialogueDisplayStyle);
+    settings.actionDisplayStyle = normalizeOverlayStyle(settings.actionDisplayStyle ?? DEFAULT_SETTINGS.actionDisplayStyle);
+    settings.narrationDisplayStyle = normalizeOverlayStyle(settings.narrationDisplayStyle ?? DEFAULT_SETTINGS.narrationDisplayStyle);
+    settings.thoughtsDisplayStyle = normalizeOverlayStyle(settings.thoughtsDisplayStyle ?? DEFAULT_SETTINGS.thoughtsDisplayStyle);
+
+    settings.dialogueTextColor = normalizeOptionalHexColor(settings.dialogueTextColor);
+    settings.actionTextColor = normalizeOptionalHexColor(settings.actionTextColor);
+    settings.narrationTextColor = normalizeOptionalHexColor(settings.narrationTextColor);
+    settings.thoughtsTextColor = normalizeOptionalHexColor(settings.thoughtsTextColor);
+
     return settings;
 }
 
@@ -417,6 +445,7 @@ async function saveMetadata() {
 // - Provide structured debug logging that can be started/stopped from the drawer.
 // - Correlate blank assistant messages with recent Vocalia trigger attempts.
 // - Wait for actual assistant messages after /trigger returns.
+// - Normalize overlay style/color values used by display rendering and settings UI.
 // ============================================================================
 
 function debug(...args) {
@@ -527,6 +556,89 @@ function isBlankAssistantMessage(message) {
 
 function getTriggerMessageTimeoutMs() {
     return TRIGGER_MESSAGE_TIMEOUT_MS;
+}
+
+function normalizeOverlayStyle(style) {
+    const value = String(style ?? '').trim();
+
+    if (value === 'none') return OVERLAY_STYLE_PLAIN;
+    if (value === 'muted_italics') return OVERLAY_STYLE_ASTERISKS;
+
+    const allowed = new Set([
+        OVERLAY_STYLE_PLAIN,
+        'muted',
+
+        OVERLAY_STYLE_BOLD,
+        OVERLAY_STYLE_ITALIC,
+        OVERLAY_STYLE_BOLD_ITALIC,
+        'muted_bold',
+        OVERLAY_STYLE_ASTERISKS,
+
+        OVERLAY_STYLE_UNDERLINE,
+        'muted_underline',
+
+        OVERLAY_STYLE_STRIKE,
+        'muted_strike',
+
+        OVERLAY_STYLE_UPPERCASE,
+        'muted_uppercase',
+
+        OVERLAY_STYLE_LOWERCASE,
+        'muted_lowercase',
+    ]);
+
+    return allowed.has(value) ? value : OVERLAY_STYLE_PLAIN;
+}
+
+function normalizeOptionalHexColor(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return '';
+
+    const match = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(text);
+    if (!match) return '';
+
+    const hex = match[1].toLowerCase();
+
+    if (hex.length === 3) {
+        return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`;
+    }
+
+    return `#${hex}`;
+}
+
+function getSegmentColorSettingKey(segmentType) {
+    switch (segmentType) {
+        case SEGMENT_DIALOGUE:
+            return 'dialogueTextColor';
+        case SEGMENT_ACTIONS:
+            return 'actionTextColor';
+        case SEGMENT_NARRATION:
+            return 'narrationTextColor';
+        case SEGMENT_THOUGHTS:
+            return 'thoughtsTextColor';
+        default:
+            return null;
+    }
+}
+
+function getSegmentDisplayStyleSettingKey(segmentType) {
+    switch (segmentType) {
+        case SEGMENT_DIALOGUE:
+            return 'dialogueDisplayStyle';
+        case SEGMENT_ACTIONS:
+            return 'actionDisplayStyle';
+        case SEGMENT_NARRATION:
+            return 'narrationDisplayStyle';
+        case SEGMENT_THOUGHTS:
+            return 'thoughtsDisplayStyle';
+        default:
+            return null;
+    }
+}
+
+function getSegmentConfiguredColor(segmentType, settings = getSettings()) {
+    const key = getSegmentColorSettingKey(segmentType);
+    return key ? normalizeOptionalHexColor(settings[key]) : '';
 }
 
 function safeLogClone(value) {
@@ -696,6 +808,7 @@ function getSettingsDebugSnapshot() {
         restoreOriginalStrategyOnDisable: settings.restoreOriginalStrategyOnDisable,
         useSlashTrigger: settings.useSlashTrigger,
         fallbackToInternalGenerate: settings.fallbackToInternalGenerate,
+        autoTurnFlow: settings.autoTurnFlow,
         maxParticipantsPerTurn: settings.maxParticipantsPerTurn,
         maxResponsesPerTurn: settings.maxResponsesPerTurn,
         maxResponsesPerParticipantPerTurn: settings.maxResponsesPerParticipantPerTurn,
@@ -710,9 +823,14 @@ function getSettingsDebugSnapshot() {
         hideCharacterNameInRefinedMessage: settings.hideCharacterNameInRefinedMessage,
         hideThoughtsInRefinedMessage: settings.hideThoughtsInRefinedMessage,
         quoteDialogue: settings.quoteDialogue,
+        dialogueDisplayStyle: settings.dialogueDisplayStyle,
         actionDisplayStyle: settings.actionDisplayStyle,
         narrationDisplayStyle: settings.narrationDisplayStyle,
         thoughtsDisplayStyle: settings.thoughtsDisplayStyle,
+        dialogueTextColor: settings.dialogueTextColor,
+        actionTextColor: settings.actionTextColor,
+        narrationTextColor: settings.narrationTextColor,
+        thoughtsTextColor: settings.thoughtsTextColor,
         promptDepth: settings.promptDepth,
         hideDebugToasts: settings.hideDebugToasts,
     };
@@ -3245,6 +3363,8 @@ async function restoreOriginalStrategyForCurrentGroup() {
 // - Require [parameters] to be inside the active character block.
 // - Prevent raw segment text from using Markdown/SillyTavern styling wrappers.
 // - Make inner segment closer matching explicit without spending tokens on examples.
+// - Keep dialogue semantically unquoted in the raw [dialogue] segment so the
+//   display layer can own optional quote wrapping consistently.
 // ============================================================================
 
 const VOCALIA_PROTOCOL_SECTION_DEFINITIONS = Object.freeze([
@@ -3293,10 +3413,10 @@ const VOCALIA_PROTOCOL_SECTION_DEFINITIONS = Object.freeze([
     {
         key: 'segment_rules',
         label: 'Semantic Segment Rules',
-        rows: 10,
+        rows: 11,
         defaultText: [
             'Use only these semantic segments, in any order, as needed:',
-            '[dialogue]spoken words only[end dialogue]',
+            '[dialogue]spoken words only, no surrounding quotation marks[end dialogue]',
             '[actions]active speaker physical action/expression/gesture only[end actions]',
             '[narration]scene/environment/consequences not performed by the active speaker[end narration]',
             '[thoughts]active speaker private thought only[end thoughts]',
@@ -3304,7 +3424,7 @@ const VOCALIA_PROTOCOL_SECTION_DEFINITIONS = Object.freeze([
             'Every segment closer must match its opener exactly.',
             'Use one closer style only: [end tag]. Never write [/end tag].',
             'Do not put actions, narration, or thoughts inside dialogue.',
-            'Do not wrap segment text in *, **, ***, _, ~, or other style markers.',
+            'Do not wrap segment text in quotes, *, **, ***, _, ~, or other style markers.',
             'Segment tags define meaning; Vocalia styles the refined display later.',
         ].join('\n'),
     },
@@ -3343,12 +3463,13 @@ const VOCALIA_PROTOCOL_SECTION_DEFINITIONS = Object.freeze([
     {
         key: 'multi_speaker_rules',
         label: 'Multi-Speaker Routing Rules',
-        rows: 6,
+        rows: 7,
         defaultText: [
             'Multi-speaker routing:',
             '- If multiple members should answer this user turn, set speakingTo=ExactName|ExactName and participationNextTurn=speak.',
             '- Name order is trigger order.',
             '- Do not exceed {{maxParticipants}} unique participants, {{maxResponses}} total responses, or {{maxPerParticipant}} response(s) per participant this user turn.',
+            '- If Vocalia automatic turn flow is disabled, metadata should still be accurate; the user will manually continue with /trigger or empty send.',
         ].join('\n'),
     },
     {
@@ -3358,7 +3479,7 @@ const VOCALIA_PROTOCOL_SECTION_DEFINITIONS = Object.freeze([
         defaultText: [
             'Parameter rules:',
             '- speakingTo=ExactName|user|none. Use exact group member names; never use user for a group member.',
-            '- participationNextTurn=speak lets Vocalia trigger the named eligible member(s).',
+            '- participationNextTurn=speak means the named eligible member(s) should speak next when automatic turn flow is enabled.',
             '- participationNextTurn=idle means stop assistant chaining unless later user input needs a response.',
             '- participationNextTurn=departing means the active speaker leaves and becomes absent.',
             '- arriving=ExactName|none only for physical scene entry/encounter/summon.',
@@ -3747,8 +3868,18 @@ function getParameterSegments(segments) {
     return segments.filter(segment => segment.type === SEGMENT_PARAMETERS);
 }
 
+function normalizeDialogueQuotesInRawStructuredText(rawText) {
+    return String(rawText ?? '').replace(
+        /\[(dialogue)\]([\s\S]*?)(\[end\s+dialogue\]|\[\/dialogue\]|\[\/end\s+dialogue\])/gi,
+        (_match, openTag, body, closeTag) => {
+            const stripped = stripOuterDialogueQuotes(body);
+            return `[${String(openTag).toLowerCase()}]${stripped}${closeTag}`;
+        },
+    );
+}
+
 function parseStructuredMessage(rawText) {
-    const text = String(rawText ?? '');
+    const text = normalizeDialogueQuotesInRawStructuredText(String(rawText ?? ''));
     const tagPrefix = getSettings().blockTagPrefix || 'character';
 
     const blockRegex = new RegExp(
@@ -3859,7 +3990,6 @@ function firstValidOwnerBlock(blocks, message) {
 // - Strip accidental raw SillyTavern/Markdown wrappers from semantic segments.
 // - Use CSS for all refined-message styles except Muted Italics.
 // - Use SillyTavern's native asterisk formatting only for Muted Italics.
-// - Avoid passing the full reconstructed message through Markdown as one blob.
 // ============================================================================
 
 function normalizePlainSegmentText(value) {
@@ -3874,13 +4004,29 @@ function stripOneBalancedOuterQuotePair(value) {
         ['"', '"'],
         ['“', '”'],
         ['‘', '’'],
+        ['«', '»'],
+        ['「', '」'],
+        ['『', '』'],
         ["'", "'"],
     ];
 
     for (const [open, close] of quotePairs) {
-        if (text.startsWith(open) && text.endsWith(close)) {
+        if (text.length > open.length + close.length && text.startsWith(open) && text.endsWith(close)) {
             return text.slice(open.length, text.length - close.length).trim();
         }
+    }
+
+    return text;
+}
+
+function stripOuterDialogueQuotes(value) {
+    let text = normalizePlainSegmentText(value);
+    if (!text) return '';
+
+    for (let index = 0; index < 5; index += 1) {
+        const stripped = stripOneBalancedOuterQuotePair(text);
+        if (stripped === text) break;
+        text = stripped;
     }
 
     return text;
@@ -3917,42 +4063,10 @@ function stripAccidentalRawSegmentFormatting(value) {
 }
 
 function buildDialogueDisplayText(value) {
-    const text = stripOneBalancedOuterQuotePair(value);
+    const text = stripOuterDialogueQuotes(value);
     if (!text) return '';
 
     return getSettings().quoteDialogue ? `"${text}"` : text;
-}
-
-function normalizeOverlayStyle(style) {
-    const value = String(style ?? '').trim();
-
-    if (value === 'none') return OVERLAY_STYLE_PLAIN;
-    if (value === 'muted_italics') return OVERLAY_STYLE_ASTERISKS;
-
-    const allowed = new Set([
-        OVERLAY_STYLE_PLAIN,
-        'muted',
-
-        OVERLAY_STYLE_BOLD,
-        OVERLAY_STYLE_ITALIC,
-        OVERLAY_STYLE_BOLD_ITALIC,
-        'muted_bold',
-        OVERLAY_STYLE_ASTERISKS,
-
-        OVERLAY_STYLE_UNDERLINE,
-        'muted_underline',
-
-        OVERLAY_STYLE_STRIKE,
-        'muted_strike',
-
-        OVERLAY_STYLE_UPPERCASE,
-        'muted_uppercase',
-
-        OVERLAY_STYLE_LOWERCASE,
-        'muted_lowercase',
-    ]);
-
-    return allowed.has(value) ? value : OVERLAY_STYLE_PLAIN;
 }
 
 function buildStyledSegmentDisplayText(value, displayStyle) {
@@ -3993,11 +4107,10 @@ function buildNativeMutedItalicsDisplayText(value) {
     return `*${text}*`;
 }
 
-function shouldUseSillyTavernFormattingForSegment(segmentType, displayStyle) {
-    if (segmentType === SEGMENT_DIALOGUE) {
-        return !!getSettings().quoteDialogue;
-    }
+function shouldUseSillyTavernFormattingForSegment(segmentType, displayStyle, forceFormatting = false) {
+    if (segmentType === SEGMENT_DIALOGUE) return false;
 
+    if (forceFormatting) return true;
     return normalizeOverlayStyle(displayStyle) === OVERLAY_STYLE_ASTERISKS;
 }
 
@@ -4049,31 +4162,80 @@ function createFormattedSegmentElement(className, displayText, message, messageI
     return span;
 }
 
-function appendStyledNonDialogueSegment(parent, segment, message, messageId, segmentClassName, displayStyle) {
+function getSegmentDisplayStyle(segmentType, settings = getSettings()) {
+    switch (segmentType) {
+        case SEGMENT_DIALOGUE:
+            return settings.dialogueDisplayStyle;
+        case SEGMENT_ACTIONS:
+            return settings.actionDisplayStyle;
+        case SEGMENT_NARRATION:
+            return settings.narrationDisplayStyle;
+        case SEGMENT_THOUGHTS:
+            return settings.thoughtsDisplayStyle;
+        default:
+            return OVERLAY_STYLE_PLAIN;
+    }
+}
+
+function getSegmentTextColor(segmentType, settings = getSettings()) {
+    switch (segmentType) {
+        case SEGMENT_DIALOGUE:
+            return normalizeOptionalHexColor(settings.dialogueTextColor);
+        case SEGMENT_ACTIONS:
+            return normalizeOptionalHexColor(settings.actionTextColor);
+        case SEGMENT_NARRATION:
+            return normalizeOptionalHexColor(settings.narrationTextColor);
+        case SEGMENT_THOUGHTS:
+            return normalizeOptionalHexColor(settings.thoughtsTextColor);
+        default:
+            return '';
+    }
+}
+
+function createSegmentParagraph(segmentType, displayStyle, textColor = '') {
+    const paragraph = document.createElement('div');
+    const normalizedStyle = normalizeOverlayStyle(displayStyle);
+    const normalizedColor = normalizeOptionalHexColor(textColor);
+
+    paragraph.className = `aspect-vocalia-segment aspect-vocalia-segment-${segmentType}`;
+    paragraph.dataset.displayStyle = normalizedStyle;
+
+    if (normalizedColor) {
+        paragraph.dataset.hasCustomColor = 'true';
+        paragraph.style.setProperty('--aspect-vocalia-segment-color', normalizedColor);
+    }
+
+    return paragraph;
+}
+
+function appendStyledSegment(parent, segment, message, messageId, segmentClassName, displayStyle, options = {}) {
     const normalizedStyle = normalizeOverlayStyle(displayStyle);
     const rawText = normalizePlainSegmentText(segment.text);
     if (!rawText) return;
 
-    const cleanText = stripAccidentalRawSegmentFormatting(rawText);
+    const cleanText = options.stripDialogueQuotes
+        ? stripOuterDialogueQuotes(rawText)
+        : stripAccidentalRawSegmentFormatting(rawText);
+
     if (!cleanText) return;
 
-    const paragraph = document.createElement('div');
-    paragraph.className = `aspect-vocalia-segment aspect-vocalia-segment-${segment.type}`;
-    paragraph.dataset.displayStyle = normalizedStyle;
+    const displayText = options.wrapInQuotes ? `"${cleanText}"` : buildStyledSegmentDisplayText(cleanText, normalizedStyle);
+    const paragraph = createSegmentParagraph(segment.type, normalizedStyle, options.textColor);
 
-    if (shouldUseSillyTavernFormattingForSegment(segment.type, normalizedStyle)) {
+    if (shouldUseSillyTavernFormattingForSegment(segment.type, normalizedStyle, options.wrapInQuotes)) {
+        const formattedText = normalizedStyle === OVERLAY_STYLE_ASTERISKS && !options.wrapInQuotes
+            ? buildNativeMutedItalicsDisplayText(cleanText)
+            : displayText;
+
         paragraph.append(createFormattedSegmentElement(
             segmentClassName,
-            buildNativeMutedItalicsDisplayText(cleanText),
+            formattedText,
             message,
             messageId,
             cleanText,
         ));
     } else {
-        paragraph.append(createOverlaySpan(
-            segmentClassName,
-            buildStyledSegmentDisplayText(cleanText, normalizedStyle),
-        ));
+        paragraph.append(createOverlaySpan(segmentClassName, displayText));
     }
 
     parent.append(paragraph);
@@ -4085,62 +4247,57 @@ function appendSegmentElement(parent, segment, block, message, messageId) {
     if (!rawText) return;
 
     switch (segment.type) {
-        case SEGMENT_DIALOGUE: {
-            const displayText = buildDialogueDisplayText(rawText);
-            if (!displayText) return;
-
-            const paragraph = document.createElement('div');
-            paragraph.className = `aspect-vocalia-segment aspect-vocalia-segment-${segment.type}`;
-            paragraph.dataset.displayStyle = OVERLAY_STYLE_PLAIN;
-
-            if (settings.quoteDialogue) {
-                paragraph.append(createFormattedSegmentElement(
-                    'aspect-vocalia-dialogue',
-                    displayText,
-                    message,
-                    messageId,
-                    displayText,
-                ));
-            } else {
-                paragraph.append(createOverlaySpan('aspect-vocalia-dialogue', displayText));
-            }
-
-            parent.append(paragraph);
+        case SEGMENT_DIALOGUE:
+            appendStyledSegment(
+                parent,
+                segment,
+                message,
+                messageId,
+                'aspect-vocalia-dialogue',
+                settings.dialogueDisplayStyle,
+                {
+                    stripDialogueQuotes: true,
+                    wrapInQuotes: !!settings.quoteDialogue,
+                    textColor: settings.dialogueTextColor,
+                },
+            );
             break;
-        }
 
         case SEGMENT_ACTIONS:
-            appendStyledNonDialogueSegment(
+            appendStyledSegment(
                 parent,
                 segment,
                 message,
                 messageId,
                 'aspect-vocalia-actions',
                 settings.actionDisplayStyle,
+                { textColor: settings.actionTextColor },
             );
             break;
 
         case SEGMENT_NARRATION:
-            appendStyledNonDialogueSegment(
+            appendStyledSegment(
                 parent,
                 segment,
                 message,
                 messageId,
                 'aspect-vocalia-narration',
                 settings.narrationDisplayStyle,
+                { textColor: settings.narrationTextColor },
             );
             break;
 
         case SEGMENT_THOUGHTS:
             if (!shouldShowRefinedThoughts(settings)) return;
 
-            appendStyledNonDialogueSegment(
+            appendStyledSegment(
                 parent,
                 segment,
                 message,
                 messageId,
                 'aspect-vocalia-thoughts',
                 settings.thoughtsDisplayStyle,
+                { textColor: settings.thoughtsTextColor },
             );
             break;
 
@@ -4831,6 +4988,9 @@ async function triggerMember(member) {
 //   MESSAGE_RECEIVED will arrive.
 // - Handle deferred-arrival application at chain end.
 // - Validate route eligibility against physical-present OR remote members.
+// - Respect Manual Turn Flow: automatic metadata/user-turn chaining can be
+//   disabled while explicit empty-send, regenerate, continue, and /trigger
+//   workflows remain available.
 // ============================================================================
 
 function setActiveGenerationTarget(member, reason = 'unspecified') {
@@ -4865,6 +5025,25 @@ function clearActiveGenerationTarget(reason = 'unspecified') {
 function getActiveGenerationTargetMember() {
     if (!vocaliaActiveGenerationTargetAvatar) return null;
     return getMemberByAvatar(vocaliaActiveGenerationTargetAvatar, getGroupMembers());
+}
+
+function isExplicitManualTriggerReason(reason) {
+    const value = String(reason ?? '');
+
+    return (
+        value.startsWith('empty-send')
+        || value.startsWith('controlled-')
+        || value === 'manual'
+        || value === 'slash-trigger'
+        || value === 'user-slash-trigger'
+    );
+}
+
+function shouldAllowTriggerEnqueueForReason(reason) {
+    const settings = getSettings();
+
+    if (settings.autoTurnFlow !== false) return true;
+    return isExplicitManualTriggerReason(reason);
 }
 
 function recordTriggerAttemptInterrupted(attempt, reason = 'generation_interrupted') {
@@ -5295,7 +5474,21 @@ function enqueueTriggers(members, sourceMessageId, reason = 'metadata') {
         limits,
         currentCounts: safeLogClone(state.participantResponseCountsThisTurn ?? {}),
         currentChainCount: state.chainCount,
+        autoTurnFlow: getSettings().autoTurnFlow,
     });
+
+    if (!shouldAllowTriggerEnqueueForReason(reason)) {
+        logVocaliaEvent('queue.enqueue.refused', {
+            sourceMessageId,
+            reason,
+            cause: 'auto_turn_flow_disabled',
+            note: 'Automatic chaining is disabled. Explicit /trigger, empty-send, regenerate, and continue flows remain available.',
+        });
+
+        maybeApplyDeferredArrivalsAtChainEnd();
+        updateDiagnosticsPanel();
+        return;
+    }
 
     if (!members.length || limits.maxResponsesPerTurn <= 0) {
         logVocaliaEvent('queue.enqueue.refused', {
@@ -5624,6 +5817,31 @@ const VOCALIA_NATIVE_SEND_BUTTON_ID_SELECTORS = [
 const VOCALIA_NATIVE_SEND_BUTTON_CLASS_SELECTORS = [
     '.send_but',
     '.send_button',
+].join(',');
+
+const VOCALIA_NATIVE_CHAT_ROOT_SELECTOR = '#chat';
+const VOCALIA_NATIVE_MESSAGE_SELECTOR = '#chat .mes[mesid], #chat .mes';
+
+const VOCALIA_NATIVE_CONTINUE_BUTTON_SELECTORS = [
+    '#mes_continue',
+    '#continue_button',
+].join(',');
+
+const VOCALIA_NATIVE_REGENERATE_BUTTON_SELECTORS = [
+    '.swipe_left',
+    '.swipe_right',
+    '.mes_button[title="Regenerate"]',
+    '.mes_button[title="Retry"]',
+    '.mes_button[title="Reroll"]',
+    '.mes_button[title="Swipe"]',
+    '.mes_button[data-i18n="Regenerate"]',
+    '.mes_button[data-i18n="Retry"]',
+    '.mes_button[data-i18n="Reroll"]',
+    '.mes_button[data-i18n="Swipe"]',
+    '[data-action="regenerate"]',
+    '[data-action="retry"]',
+    '[data-action="reroll"]',
+    '[data-action="swipe"]',
 ].join(',');
 
 function isMemberInRouteEligibleList(member, eligibleMembers = getRouteEligibleMembersCompat()) {
@@ -6102,26 +6320,130 @@ function getElementActionText(element) {
     return pieces.join(' ').toLocaleLowerCase();
 }
 
-function detectControlledGenerationActionFromElement(element) {
-    if (!element) return null;
+function getNativeChatRootElement() {
+    return document.querySelector(VOCALIA_NATIVE_CHAT_ROOT_SELECTOR);
+}
 
-    const parts = [];
-    let current = element;
+function getNativeMessageElement(element) {
+    if (!(element instanceof Element)) return null;
 
-    while (current && current instanceof Element && parts.length < 8) {
-        parts.push(getElementActionText(current));
-        current = current.parentElement;
+    const messageElement = element.closest(VOCALIA_NATIVE_MESSAGE_SELECTOR);
+    const chatRoot = getNativeChatRootElement();
+
+    if (!messageElement) return null;
+    if (chatRoot && !chatRoot.contains(messageElement)) return null;
+
+    return messageElement;
+}
+
+function isWithinNativeChatMessage(element) {
+    return !!getNativeMessageElement(element);
+}
+
+function getNativeContinueButtonElement(element) {
+    if (!(element instanceof Element)) return null;
+
+    const candidate = element.closest(VOCALIA_NATIVE_CONTINUE_BUTTON_SELECTORS);
+    if (!candidate) return null;
+
+    // Continue is a native global composer control, not a per-message control.
+    // Require the exact native element/ID instead of accepting generic labels
+    // or third-party extension buttons.
+    if (candidate.id === 'mes_continue' || candidate.id === 'continue_button') {
+        return candidate;
     }
 
-    const haystack = parts.join(' ');
+    return null;
+}
 
-    if (/\b(regenerate|reroll|retry|redo|swipe)\b/i.test(haystack)) return 'regenerate';
-    if (/\b(fa-rotate-right|fa-redo|fa-repeat|fa-sync|fa-arrows-rotate)\b/i.test(haystack)) return 'regenerate';
+function getNativeRegenerateButtonElement(element) {
+    if (!(element instanceof Element)) return null;
 
-    if (/\b(continue|continue response|続きを生成|continuar|continuer)\b/i.test(haystack)) return 'continue';
-    if (/\b(fa-forward|fa-forward-step|fa-play)\b/i.test(haystack) && /\bcontinue\b/i.test(haystack)) return 'continue';
+    const candidate = element.closest(VOCALIA_NATIVE_REGENERATE_BUTTON_SELECTORS);
+    if (!candidate) return null;
+
+    // Regenerate/reroll/swipe controls are native only when they belong to an
+    // actual SillyTavern chat message. This prevents extension panels such as
+    // ST-Copilot from being captured merely because they contain buttons named
+    // "regenerate", "continue", "retry", or similar.
+    if (isWithinNativeChatMessage(candidate)) return candidate;
 
     return null;
+}
+
+function getNativeControlledGenerationElement(element) {
+    if (!(element instanceof Element)) {
+        return {
+            action: null,
+            element: null,
+        };
+    }
+
+    const continueButton = getNativeContinueButtonElement(element);
+    if (continueButton) {
+        return {
+            action: 'continue',
+            element: continueButton,
+        };
+    }
+
+    const regenerateButton = getNativeRegenerateButtonElement(element);
+    if (regenerateButton) {
+        return {
+            action: 'regenerate',
+            element: regenerateButton,
+        };
+    }
+
+    const nativeMessage = getNativeMessageElement(element);
+    if (!nativeMessage) {
+        return {
+            action: null,
+            element: null,
+        };
+    }
+
+    const clickable = getClickableActionElement(element);
+    if (!clickable || !nativeMessage.contains(clickable)) {
+        return {
+            action: null,
+            element: null,
+        };
+    }
+
+    // Fallback is intentionally scoped to native message action surfaces only.
+    // It is not a global "text says regenerate/continue" detector.
+    const isNativeMessageButton = !!clickable.closest(
+        '.mes_button, .swipe_left, .swipe_right, [data-action], [data-command]',
+    );
+
+    if (!isNativeMessageButton) {
+        return {
+            action: null,
+            element: null,
+        };
+    }
+
+    const haystack = getElementActionText(clickable);
+
+    if (/\b(regenerate|reroll|retry|redo|swipe)\b/i.test(haystack)) {
+        return {
+            action: 'regenerate',
+            element: clickable,
+        };
+    }
+
+    if (/\b(fa-rotate-right|fa-redo|fa-repeat|fa-sync|fa-arrows-rotate)\b/i.test(haystack)) {
+        return {
+            action: 'regenerate',
+            element: clickable,
+        };
+    }
+
+    return {
+        action: null,
+        element: null,
+    };
 }
 
 function getMessageIdFromDomElement(element) {
@@ -6808,10 +7130,14 @@ async function handleVocaliaControlledGeneration(action, clickedElement, source 
 function interceptControlledGenerationEvent(event, source) {
     if (!getSettings().enabled || !ctx().groupId) return false;
 
-    const clickable = getClickableActionElement(event.target);
-    const action = detectControlledGenerationActionFromElement(clickable);
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return false;
 
-    if (!action) return false;
+    const controlled = getNativeControlledGenerationElement(target);
+    const action = controlled.action;
+    const clickedElement = controlled.element;
+
+    if (!action || !clickedElement) return false;
 
     stopNativeSendEvent(event);
 
@@ -6820,11 +7146,14 @@ function interceptControlledGenerationEvent(event, source) {
         source,
         eventType: event.type,
         chatLength: ctx().chat?.length ?? null,
-        clickedElementText: getElementActionText(clickable).slice(0, 500),
-        clickedMessageId: getMessageIdFromDomElement(clickable),
+        clickedElementText: getElementActionText(clickedElement).slice(0, 500),
+        clickedMessageId: getMessageIdFromDomElement(clickedElement),
+        nativeScope: action === 'continue'
+            ? 'native_global_continue_control'
+            : 'native_chat_message_control',
     }, { force: true });
 
-    void handleVocaliaControlledGeneration(action, clickable, source);
+    void handleVocaliaControlledGeneration(action, clickedElement, source);
 
     return true;
 }
@@ -7155,14 +7484,14 @@ function selectContinuationTargetsForUserMessage(userMessageId, state) {
     if (getSettings().firstMessageFallback === FIRST_MESSAGE_FALLBACK_RANDOM_PRESENT && latestEligibleMembers.length) {
         const randomMember = randomItem(latestEligibleMembers);
         return {
-            reason: 'random-route-eligible-continuation-fallback',
+            reason: 'random-route-eligible-fallback-continuation',
             targets: randomMember ? [randomMember] : [],
         };
     }
 
     if (getSettings().firstMessageFallback === FIRST_MESSAGE_FALLBACK_FIRST_PRESENT && latestEligibleMembers.length) {
         return {
-            reason: 'first-route-eligible-continuation-fallback',
+            reason: 'first-route-eligible-fallback-continuation',
             targets: latestEligibleMembers.slice(0, 1),
         };
     }
@@ -7220,6 +7549,18 @@ async function handleUserMessage(eventValue) {
     updateDiagnosticsPanel();
 
     recordWitnessesForUserMessage(userMessageId, 'message_sent');
+
+    if (settings.autoTurnFlow === false) {
+        logVocaliaEvent('user_turn.auto_flow_disabled', {
+            userMessageId,
+            note: 'User-message state was updated, but Vocalia will not auto-trigger a speaker. Use /trigger or empty send manually.',
+        }, { force: true });
+
+        syncAssistantCountSinceUserFromChat(userMessageId, 'user_turn_auto_flow_disabled');
+        await saveMetadata();
+        updateDiagnosticsPanel();
+        return;
+    }
 
     const assistantMessagesBefore = getAssistantMessagesBefore(userMessageId);
     const isOpeningUserMessage = assistantMessagesBefore.length === 0;
@@ -7409,6 +7750,51 @@ function warnBypassRoutingRefused(messageId, bypassDecision) {
     }, { force: true });
 }
 
+async function saveChatAfterVocaliaMessageMutation() {
+    const context = ctx();
+
+    try {
+        if (typeof context.saveChat === 'function') {
+            await context.saveChat();
+            return;
+        }
+
+        if (typeof context.saveChatConditional === 'function') {
+            await context.saveChatConditional();
+            return;
+        }
+
+        if (typeof context.saveChatDebounced === 'function') {
+            context.saveChatDebounced();
+        }
+    } catch (error) {
+        warn('Failed to persist Vocalia structured message normalization.', error);
+    }
+}
+
+async function normalizeGeneratedStructuredMessageInChat(messageId, message) {
+    if (!message || message.is_user || message.is_system) return false;
+
+    const original = String(message.mes ?? '');
+    if (!original) return false;
+
+    const normalized = normalizeDialogueQuotesInRawStructuredText(original);
+    if (normalized === original) return false;
+
+    message.mes = normalized;
+
+    logVocaliaEvent('assistant_message.dialogue_quotes_stripped', {
+        messageId,
+        beforePreview: original.slice(0, 1000),
+        afterPreview: normalized.slice(0, 1000),
+        note: 'Dialogue segment contents are kept unquoted in raw chat. Display quote wrapping remains controlled by the existing quoteDialogue setting.',
+    }, { force: true });
+
+    await saveChatAfterVocaliaMessageMutation();
+
+    return true;
+}
+
 async function handleMessageReceived(eventValue) {
     const settings = getSettings();
 
@@ -7450,6 +7836,8 @@ async function handleMessageReceived(eventValue) {
         handleBlankAssistantMessage(messageId, message);
         return;
     }
+
+    await normalizeGeneratedStructuredMessageInChat(messageId, message);
 
     const blocks = parseStructuredMessage(message.mes);
 
@@ -7556,7 +7944,15 @@ async function handleMessageReceived(eventValue) {
         targets: targets.map(memberDebugSummary),
     });
 
-    if (targets.length) {
+    if (targets.length && settings.autoTurnFlow === false) {
+        logVocaliaEvent('assistant_message.auto_flow_disabled_targets_not_enqueued', {
+            messageId,
+            targets: targets.map(memberDebugSummary),
+            note: 'Routing state was updated, but automatic next-speaker chaining is disabled.',
+        }, { force: true });
+
+        maybeApplyDeferredArrivalsAtChainEnd();
+    } else if (targets.length) {
         enqueueTriggers(targets, messageId, 'participation-next-turn');
     } else {
         maybeApplyDeferredArrivalsAtChainEnd();
@@ -7640,6 +8036,7 @@ async function handleGroupUpdated() {
 // - Right-align number inputs.
 // - Support viewport-constrained popups and tooltips.
 // - Style semantic overlay nodes without using Markdown as the structure layer.
+// - Support per-segment custom colors and color-picker popovers.
 // ============================================================================
 
 const VOCALIA_DEFAULT_MANIFEST_META = Object.freeze({
@@ -7656,216 +8053,93 @@ const VOCALIA_LABEL_HELP = Object.freeze({
     auto_manual: 'Automatically changes the active group reply strategy to Manual while Vocalia is enabled, preventing native random group speaker selection.',
     restore_strategy: 'Restores the group reply strategy Vocalia found before it changed the group to Manual.',
 
-    turn_flow: 'Controls how many group members may participate after one user message and how Vocalia selects first-turn speakers.',
+    turn_flow: 'Controls how group members participate after one user message, including whether Vocalia automatically triggers the next speaker.',
+    automatic_turn_flow: 'When enabled, Vocalia automatically triggers speakers from user messages and participationNextTurn=speak metadata. When disabled, Vocalia still tracks state, but you manually continue with /trigger or empty send.',
     arrival_mode: 'Controls whether arriving characters become present immediately or after the current automatic response chain ends.',
     first_name_match: 'On the first user message of an empty chat, tries to trigger a present, remote, or locally summoned character by exact or unique name match.',
-    first_fallback: 'Controls what Vocalia does on the first message when no character name match or summon is detected.',
-    max_participants: 'Maximum number of unique assistant participants allowed after one user message.',
-    max_responses: 'Maximum total assistant responses allowed after one user message.',
-    max_responses_per_participant: 'Maximum number of times one specific character may respond after one user message.',
-    response_delay: 'Delay, in seconds, before Vocalia triggers the next queued assistant response.',
+    first_fallback: 'Controls who speaks first when the first user message does not name, summon, contact, or otherwise identify a target.',
+    max_participants: 'Maximum number of unique group members Vocalia may trigger from one user turn.',
+    max_responses: 'Maximum total assistant responses Vocalia may trigger from one user turn.',
+    max_responses_per_participant: 'Maximum number of responses any one participant may produce during one user turn.',
+    response_delay: 'Delay between Vocalia-triggered responses. Useful for avoiding overlapping generation calls.',
 
-    refined_display: 'Controls how structured Vocalia messages are rendered as readable roleplay text in the chat UI.',
-    render_overlay: 'Displays the raw structured message as a refined readable message without changing the stored chat text.',
-    hide_empty_blocks: 'Hides empty structured block placeholders in refined messages.',
-    hide_character_name: 'Hides the active character label in refined messages.',
-    hide_thoughts: 'Hides private [thoughts] segments in refined messages.',
-    quote_dialogue: 'Wraps dialogue in quotes when displaying refined messages.',
-    action_style: 'Visual style applied to [actions] segments.',
-    narration_style: 'Visual style applied to [narration] segments.',
-    thoughts_style: 'Visual style applied to [thoughts] segments.',
+    refined_display: 'Controls how raw structured Vocalia output is rendered in chat as dialogue, actions, narration, and thoughts.',
+    render_overlay: 'When enabled, Vocalia hides the raw structured block display and renders a refined semantic view instead.',
+    hide_empty_blocks: 'When enabled, empty structured sections are not rendered in the refined message display.',
+    hide_character_name: 'When enabled, the character name from the structured block is hidden in the refined message display.',
+    hide_thoughts: 'When enabled, [thoughts] segments are not shown in the refined message display.',
+    quote_dialogue: 'When enabled, Vocalia adds display quotes around dialogue. Model-provided raw dialogue quotes are stripped first so this setting owns quote wrapping.',
+    dialogue_style: 'Controls the refined display style for dialogue segments.',
+    narration_style: 'Controls the refined display style for narration segments.',
+    action_style: 'Controls the refined display style for action segments.',
+    thoughts_style: 'Controls the refined display style for thoughts segments.',
+    dialogue_color: 'Optional custom text color for dialogue. Leave blank to use the theme default.',
+    narration_color: 'Optional custom text color for narration. Leave blank to use the theme default.',
+    action_color: 'Optional custom text color for actions. Leave blank to use the theme default.',
+    thoughts_color: 'Optional custom text color for thoughts. Leave blank to use the theme default.',
 
-    protocol: 'Controls the Vocalia protocol prompt and diagnostic toast behavior.',
-    prompt_depth: 'Depth where Vocalia protocol instructions are injected into the prompt.',
-    hide_debug_toasts: 'Suppresses non-critical Vocalia debug toasts.',
+    protocol: 'Controls the prompt instructions Vocalia injects to request structured character, segment, and routing output.',
+    prompt_depth: 'Controls the SillyTavern extension prompt depth used for the Vocalia protocol prompt.',
+    hide_debug_toasts: 'Suppresses informational debug toasts while preserving important warning and error toasts.',
 
-    memory: 'Controls what conversation history a character can recall based on whether they were present or remotely connected when messages occurred.',
-    recall_presence: 'When enabled, Vocalia filters prompt history so a character only recalls messages they witnessed while present or remotely connected.',
+    memory: 'Controls who can recall messages based on whether they were present or remote when those messages occurred.',
+    recall_presence: 'When enabled, Vocalia filters prompt history so a target member only sees messages they witnessed, unless that member is omniscient.',
 
-    status_section: 'Opens scene status diagnostics. Present means physically in-scene. Remote means active phone, radio, video, or text contact. Absent means neither present nor remotely connected.',
-    status_popup: 'Shows current scene arrays and lets you manually adjust each group member’s Vocalia status for testing or correction.',
-    status_arrays: 'Current Vocalia scene arrays for the active group chat.',
-    status_member_table: 'Lists every participant, whether they are enabled in the group, whether they override Presence Required for Message Recall through Omniscience, their response count this turn, and their current Vocalia status.',
-    sync_state: 'Rebuilds Vocalia scene state from the active group roster. Useful after changing group members or recovering from mismatched diagnostics.',
+    status_section: 'Shows current Vocalia state, roster arrays, participant statuses, and response allowance tracking.',
+    status_popup: 'Opens a live state panel for reviewing and manually correcting participant status.',
+    status_arrays: 'Shows the current internal scene-state arrays: present, remote, idle, arriving, departing, absent, and triggered.',
+    status_member_table: 'Allows manual inspection and correction of each group member’s Vocalia status and omniscience flag.',
+    sync_state: 'Rebuilds Vocalia state from the current SillyTavern group roster and active settings.',
 
-    debug_popup: 'Collects a focused diagnostic trace. Start logging, reproduce the issue, then copy or download the log.',
-    debug_status: 'Shows whether debug logging is active, how many entries are buffered, and the start/stop timestamps.',
-    debug_log_controls: 'Start, stop, copy, download, or clear the current debug trace.',
-    dump_state: 'Prints Vocalia settings, chat state, and debug bundle to the browser console.',
+    debug_popup: 'Opens the debug log controls and live diagnostic state.',
+    debug_status: 'Shows whether debug logging is active and how many events have been captured.',
+    debug_log_controls: 'Start, stop, copy, download, or clear Vocalia’s structured debug log.',
+    dump_state: 'Writes the current Vocalia state snapshot into the debug log.',
 
-    utilities: 'Small one-off tools for refreshing Vocalia display behavior.',
-    render_now: 'Reapplies the current refined-message display setting to visible messages.',
+    utilities: 'Manual maintenance and refresh actions.',
+    render_now: 'Re-renders currently visible structured messages using the latest refined display settings.',
 });
 
-let vocaliaManifestMeta = { ...VOCALIA_DEFAULT_MANIFEST_META };
-
-function injectStyles() {
+function installStyles() {
     if (styleElement) return;
 
     styleElement = document.createElement('style');
-    styleElement.id = 'aspect_vocalia_styles';
+    styleElement.id = 'aspect-vocalia-styles';
     styleElement.textContent = `
-        #aspect_vocalia_settings small { opacity: 0.8; line-height: 1.35; }
-
-        #aspect_vocalia_settings input[type="number"] {
-            max-width: 8em;
-            text-align: right;
-        }
-
-        #aspect_vocalia_settings select { max-width: 18em; }
-
-        #aspect_vocalia_settings .checkbox_label {
-            align-items: flex-start;
-            line-height: 1.2;
-        }
-
-        #aspect_vocalia_settings .checkbox_label input[type="checkbox"] {
-            margin-top: 0.12em;
-            flex: 0 0 auto;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-settings-box {
-            border: 1px solid #000;
-            border-radius: 10px;
-            padding: 10px;
-            margin: 8px 0;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-settings-tagline {
-            font: inherit;
-            font-size: 0.9em;
-            opacity: 0.75;
-            text-align: right;
-            margin: 0 0 8px;
+        #aspect_vocalia_settings .aspect-vocalia-section-title {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 0.45em 0.65em;
+            margin: 0.8em 0 0.45em;
+            border-radius: 4px;
+            background: #000;
+            color: #fff;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-settings-section {
-            position: relative;
-            padding: 12px 0 10px;
-            border-top: none;
+            margin-bottom: 0.65em;
         }
-
-        #aspect_vocalia_settings .aspect-vocalia-settings-section:first-of-type {
-            padding-top: 0;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-section-title,
-        #aspect_vocalia_settings .aspect-vocalia-label,
-        #aspect_vocalia_settings .aspect-vocalia-popup-title {
-            font-weight: 600;
-            font-size: 0.95rem;
-            opacity: 0.95;
-            line-height: 1.25;
-        }
-
-		#aspect_vocalia_settings .aspect-vocalia-section-title,
-		#aspect_vocalia_settings .aspect-vocalia-popup-title {
-			display: block;
-			box-sizing: border-box;
-			width: 100%;
-			font-weight: 700;
-			margin: 0 0 10px;
-			padding: 6px 10px;
-			border: 0;
-			border-radius: 4px;
-			background:
-				/* Dark texture: visible mainly inside the bright highlight */
-				repeating-linear-gradient(
-					135deg,
-					rgba(0,0,0,0.05) 0 1px,
-					transparent 1px 5px
-				),
-
-				/* Light sweep / highlight */
-				linear-gradient(
-					115deg,
-					transparent 0%,
-					transparent 24%,
-					#0d0d0d 33%,
-					#171717 41%,
-					#222222 49%,
-					#171717 57%,
-					transparent 68%,
-					transparent 100%
-				),
-
-				/* Light texture: visible mainly in the darker portions */
-				repeating-linear-gradient(
-					135deg,
-					rgba(255,255,255,0.045) 0 1px,
-					transparent 1px 5px
-				),
-
-				/* Base bar color */
-				linear-gradient(
-					180deg,
-					#141414 0%,
-					#050505 100%
-				);
-			color: #fff;
-			box-shadow:
-				inset 0 1px 0 rgba(255,255,255,0.08),
-				inset 0 -1px 0 rgba(0,0,0,0.7);
-			letter-spacing: 0.01em;
-			opacity: 1;
-		}
-
-		#aspect_vocalia_settings .aspect-vocalia-section-title .aspect-vocalia-info-trigger-text,
-		#aspect_vocalia_settings .aspect-vocalia-popup-title .aspect-vocalia-info-trigger-text {
-			border-color: rgba(255,255,255,0.85);
-			background: #fff;
-			color: #111111;
-		}
 
         #aspect_vocalia_settings .aspect-vocalia-label,
         #aspect_vocalia_settings .aspect-vocalia-label-text {
-            display: inline;
-            line-height: 1.25;
-            cursor: pointer;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-critical-box {
-            border: 1px solid rgba(183, 110, 121, 0.65);
-            outline: 1px solid rgba(183, 110, 121, 0.65);
-            outline-offset: 2px;
-            border-radius: 12px;
-            padding: 10px;
-            margin: 10px 0 14px;
-            background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.08));
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-critical-enable-row,
-        #aspect_vocalia_settings .aspect-vocalia-critical-button-row,
-        #aspect_vocalia_settings .aspect-vocalia-button-row {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-critical-enable-row {
-            align-items: flex-start;
-            margin-bottom: 10px;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-inline-unit {
-            opacity: 0.85;
-            margin-left: 0.35em;
-            white-space: nowrap;
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-control-with-tip {
             display: inline-flex;
             align-items: center;
-            gap: 4px;
-            flex: 0 0 auto;
+            gap: 0.25em;
         }
 
-        #aspect_vocalia_settings button,
-        #aspect_vocalia_settings input[type="button"] {
-            width: auto;
-            min-width: max-content;
-            white-space: nowrap;
+        #aspect_vocalia_settings input[type="number"],
+        #aspect_vocalia_settings .aspect-vocalia-number-input {
+            text-align: right;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-button-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45em;
+            align-items: center;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-popup-wrap {
@@ -7873,40 +8147,28 @@ function injectStyles() {
             display: inline-flex;
         }
 
-        #aspect_vocalia_settings .aspect-vocalia-popup-button {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            white-space: nowrap;
-            width: auto;
-            min-width: max-content;
-            flex: 0 0 auto;
-        }
-
         #aspect_vocalia_settings .aspect-vocalia-popup {
-            display: none;
-            position: absolute;
-            left: 0;
-            top: calc(100% + 4px);
-            z-index: 10000;
-            box-sizing: border-box;
-            padding: 10px;
-            border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.25));
-            border-radius: 8px;
-            background: var(--SmartThemeBlurTintColor, var(--SmartThemeBodyColor, #1e1e1e));
-            box-shadow: 0 4px 12px rgba(0,0,0,0.35);
-        }
-
-        #aspect_vocalia_settings .aspect-vocalia-popup.aspect-vocalia-popup-open {
             position: fixed;
             left: var(--aspect-vocalia-popup-left, 8px);
             top: var(--aspect-vocalia-popup-top, 8px);
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            width: min(680px, calc(100vw - 16px));
+            z-index: 2147483644;
+            display: none;
+            width: min(420px, calc(100vw - 16px));
             max-height: calc(100vh - 16px);
             overflow: auto;
+            padding: 0.75em;
+            border: 1px solid var(--SmartThemeBorderColor);
+            border-radius: 10px;
+            background: var(--SmartThemeBlurTintColor, rgba(28, 28, 28, 1));
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-popup.aspect-vocalia-popup-open {
+            display: block;
+        }
+
+        #aspect_vocalia_status_popup.aspect-vocalia-popup-open {
+            width: min(760px, calc(100vw - 16px));
         }
 
         #aspect_vocalia_debug_popup.aspect-vocalia-popup-open {
@@ -7976,10 +8238,10 @@ function injectStyles() {
             font-size: 0.85em;
             word-break: break-all;
         }
-		
-		#aspect_vocalia_member_state_table .aspect-vocalia-member-omniscience-cell {
-			text-align: center;
-		}
+
+        #aspect_vocalia_member_state_table .aspect-vocalia-member-omniscience-cell {
+            text-align: center;
+        }
 
         .aspect-vocalia-array-list {
             display: grid;
@@ -8021,6 +8283,85 @@ function injectStyles() {
         #aspect_vocalia_settings #aspect_vocalia_settings_author {
             text-align: right;
             margin-left: auto;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-style-control-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5em;
+            width: 100%;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-style-control-row select {
+            flex: 1 1 auto;
+            min-width: 0;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-control {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            flex: 0 0 auto;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-swatch {
+            width: 1.75em;
+            height: 1.55em;
+            border: 1px solid var(--SmartThemeBorderColor);
+            border-radius: 5px;
+            cursor: pointer;
+            background:
+                linear-gradient(45deg, rgba(127,127,127,0.35) 25%, transparent 25%),
+                linear-gradient(-45deg, rgba(127,127,127,0.35) 25%, transparent 25%),
+                linear-gradient(45deg, transparent 75%, rgba(127,127,127,0.35) 75%),
+                linear-gradient(-45deg, transparent 75%, rgba(127,127,127,0.35) 75%);
+            background-size: 10px 10px;
+            background-position: 0 0, 0 5px, 5px -5px, -5px 0;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-swatch:not(.aspect-vocalia-color-empty) {
+            background-image: none;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-popover {
+            position: fixed;
+            z-index: 2147483645;
+            display: none;
+            grid-template-columns: auto auto;
+            gap: 0.55em;
+            align-items: center;
+            left: var(--aspect-vocalia-color-popover-left, 8px);
+            top: var(--aspect-vocalia-color-popover-top, 8px);
+            padding: 0.7em;
+            border: 1px solid var(--SmartThemeBorderColor);
+            border-radius: 10px;
+            background: var(--SmartThemeBlurTintColor, rgba(28, 28, 28, 1));
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-control.is-open .aspect-vocalia-color-popover {
+            display: grid;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-native-color-picker {
+            width: 92px;
+            height: 92px;
+            padding: 0;
+            border: none;
+            border-radius: 999px;
+            overflow: hidden;
+            cursor: pointer;
+            background: transparent;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-hex-input {
+            width: 96px;
+            font-family: var(--monoFontFamily, monospace);
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-clear {
+            grid-column: 1 / -1;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-info-tooltip {
@@ -8120,7 +8461,13 @@ function injectStyles() {
 
         .aspect-vocalia-block + .aspect-vocalia-block { margin-top: 0.75em; }
         .aspect-vocalia-character-label { font-weight: 700; }
-        .aspect-vocalia-segment { white-space: pre-wrap; }
+
+        .aspect-vocalia-segment {
+            --aspect-vocalia-segment-color: inherit;
+            color: var(--aspect-vocalia-segment-color);
+            white-space: pre-wrap;
+        }
+
         .aspect-vocalia-segment-dialogue { font-style: normal; }
 
         .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ITALIC}"] { font-style: italic; }
@@ -8132,13 +8479,13 @@ function injectStyles() {
         .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_LOWERCASE}"] { text-transform: lowercase; }
 
         .aspect-vocalia-segment[data-display-style="muted"],
-		.aspect-vocalia-segment[data-display-style="muted_bold"],
-		.aspect-vocalia-segment[data-display-style="muted_underline"],
-		.aspect-vocalia-segment[data-display-style="muted_strike"],
-		.aspect-vocalia-segment[data-display-style="muted_uppercase"],
-		.aspect-vocalia-segment[data-display-style="muted_lowercase"] {
-			color: var(--SmartThemeEmColor);
-		}
+        .aspect-vocalia-segment[data-display-style="muted_bold"],
+        .aspect-vocalia-segment[data-display-style="muted_underline"],
+        .aspect-vocalia-segment[data-display-style="muted_strike"],
+        .aspect-vocalia-segment[data-display-style="muted_uppercase"],
+        .aspect-vocalia-segment[data-display-style="muted_lowercase"] {
+            color: var(--aspect-vocalia-segment-color, var(--SmartThemeEmColor));
+        }
 
         .aspect-vocalia-segment[data-display-style="muted_bold"] { font-weight: 700; }
         .aspect-vocalia-segment[data-display-style="muted_underline"] { text-decoration: underline; }
@@ -8176,12 +8523,13 @@ function injectStyles() {
 }
 
 // ============================================================================
-// Section 18. Settings UI Manifest, Protocol Editor, and Tooltips
+// Section 18. Settings UI Manifest, Protocol Editor, Color Picker, and Tooltips
 // ============================================================================
 // Purpose:
 // - Load manifest metadata for the drawer footer.
 // - Render editable protocol-injection fields.
 // - Shield editable popup fields from global keyboard/clipboard handlers.
+// - Provide reusable color-wheel + hex-entry color picker controls.
 // - Provide reference-style viewport-constrained info tooltips.
 // ============================================================================
 
@@ -8352,6 +8700,342 @@ function bindProtocolInjectionEditorUi() {
     root.attr('data-protocol-bound', 'true');
 }
 
+function renderVocaliaColorPickerControl(settingKey, inputId) {
+    const settings = getSettings();
+    const value = normalizeOptionalHexColor(settings[settingKey]);
+    const safeSettingKey = escapeHtml(settingKey);
+    const safeInputId = escapeHtml(inputId);
+    const swatchStyle = value ? ` style="background-color: ${escapeHtml(value)}"` : '';
+
+    return `
+        <span class="aspect-vocalia-color-control" data-color-setting="${safeSettingKey}">
+            <button
+                type="button"
+                class="aspect-vocalia-color-swatch${value ? '' : ' aspect-vocalia-color-empty'}"
+                data-color-swatch="${safeSettingKey}"
+                aria-label="Choose color"
+                title="${value ? `Current color: ${escapeHtml(value)}` : 'Theme default color'}"
+                ${swatchStyle}
+            ></button>
+            <span class="aspect-vocalia-color-popover" data-color-popover="${safeSettingKey}">
+                <canvas
+                    class="aspect-vocalia-color-wheel"
+                    data-color-wheel="${safeSettingKey}"
+                    width="132"
+                    height="132"
+                    style="width:132px;height:132px;border-radius:999px;cursor:crosshair;"
+                    aria-label="Color wheel"
+                ></canvas>
+                <input
+                    id="${safeInputId}"
+                    class="text_pole aspect-vocalia-color-hex-input"
+                    type="text"
+                    value="${escapeHtml(value)}"
+                    placeholder="#rrggbb"
+                    spellcheck="false"
+                    data-color-hex="${safeSettingKey}"
+                >
+                <button
+                    type="button"
+                    class="menu_button aspect-vocalia-color-clear"
+                    data-color-clear="${safeSettingKey}"
+                >Default</button>
+            </span>
+        </span>`;
+}
+
+function hsvToRgb(hue, saturation, value = 1) {
+    const h = ((Number(hue) % 360) + 360) % 360;
+    const s = Math.min(1, Math.max(0, Number(saturation) || 0));
+    const v = Math.min(1, Math.max(0, Number(value) || 0));
+    const c = v * s;
+    const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+    const m = v - c;
+
+    let r = 0;
+    let g = 0;
+    let b = 0;
+
+    if (h < 60) {
+        r = c; g = x; b = 0;
+    } else if (h < 120) {
+        r = x; g = c; b = 0;
+    } else if (h < 180) {
+        r = 0; g = c; b = x;
+    } else if (h < 240) {
+        r = 0; g = x; b = c;
+    } else if (h < 300) {
+        r = x; g = 0; b = c;
+    } else {
+        r = c; g = 0; b = x;
+    }
+
+    return {
+        r: Math.round((r + m) * 255),
+        g: Math.round((g + m) * 255),
+        b: Math.round((b + m) * 255),
+    };
+}
+
+function rgbToHex({ r, g, b }) {
+    return `#${[r, g, b].map(value => {
+        const safe = Math.min(255, Math.max(0, Math.round(Number(value) || 0)));
+        return safe.toString(16).padStart(2, '0');
+    }).join('')}`;
+}
+
+function drawVocaliaColorWheel(canvas) {
+    if (!(canvas instanceof HTMLCanvasElement)) return;
+
+    const context = canvas.getContext('2d');
+    if (!context) return;
+
+    const width = canvas.width;
+    const height = canvas.height;
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const radius = Math.min(centerX, centerY) - 1;
+    const image = context.createImageData(width, height);
+
+    for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+            const dx = x - centerX;
+            const dy = y - centerY;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            const offset = (y * width + x) * 4;
+
+            if (distance > radius) {
+                image.data[offset + 0] = 0;
+                image.data[offset + 1] = 0;
+                image.data[offset + 2] = 0;
+                image.data[offset + 3] = 0;
+                continue;
+            }
+
+            const hue = ((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360;
+            const saturation = Math.min(1, distance / radius);
+            const rgb = hsvToRgb(hue, saturation, 1);
+
+            image.data[offset + 0] = rgb.r;
+            image.data[offset + 1] = rgb.g;
+            image.data[offset + 2] = rgb.b;
+            image.data[offset + 3] = 255;
+        }
+    }
+
+    context.putImageData(image, 0, 0);
+}
+
+function getVocaliaColorFromWheelEvent(canvas, event) {
+    const rect = canvas.getBoundingClientRect();
+    const x = Number(event.clientX) - rect.left;
+    const y = Number(event.clientY) - rect.top;
+    const centerX = rect.width / 2;
+    const centerY = rect.height / 2;
+    const dx = x - centerX;
+    const dy = y - centerY;
+    const radius = Math.min(centerX, centerY);
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    if (distance > radius) return null;
+
+    const hue = ((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360;
+    const saturation = Math.min(1, distance / radius);
+
+    return rgbToHex(hsvToRgb(hue, saturation, 1));
+}
+
+function syncVocaliaColorPickerControl(settingKey) {
+    const settings = getSettings();
+    const color = normalizeOptionalHexColor(settings[settingKey]);
+    const root = document.getElementById('aspect_vocalia_settings');
+    if (!root) return;
+
+    const control = root.querySelector(`.aspect-vocalia-color-control[data-color-setting="${cssEscape(settingKey)}"]`);
+    if (!control) return;
+
+    const swatch = control.querySelector('.aspect-vocalia-color-swatch');
+    const hexInput = control.querySelector('.aspect-vocalia-color-hex-input');
+
+    if (hexInput) hexInput.value = color;
+
+    if (swatch) {
+        swatch.classList.toggle('aspect-vocalia-color-empty', !color);
+        swatch.title = color ? `Current color: ${color}` : 'Theme default color';
+
+        if (color) {
+            swatch.style.backgroundColor = color;
+        } else {
+            swatch.style.removeProperty('background-color');
+        }
+    }
+}
+
+function setVocaliaSegmentColorSetting(settingKey, value) {
+    const settings = getSettings();
+    const color = normalizeOptionalHexColor(value);
+
+    settings[settingKey] = color;
+    syncVocaliaColorPickerControl(settingKey);
+    saveSettings();
+    renderAllVisibleOverlays();
+}
+
+function positionVocaliaColorPopover(control) {
+    if (!control) return;
+
+    const popover = control.querySelector('.aspect-vocalia-color-popover');
+    const swatch = control.querySelector('.aspect-vocalia-color-swatch');
+    if (!popover || !swatch) return;
+
+    const padding = 8;
+    const swatchRect = swatch.getBoundingClientRect();
+
+    popover.style.setProperty('--aspect-vocalia-color-popover-left', '8px');
+    popover.style.setProperty('--aspect-vocalia-color-popover-top', '8px');
+
+    const popoverRect = popover.getBoundingClientRect();
+    const left = Math.min(
+        Math.max(padding, swatchRect.right - popoverRect.width),
+        Math.max(padding, window.innerWidth - popoverRect.width - padding),
+    );
+    const top = Math.min(
+        Math.max(padding, swatchRect.bottom + 6),
+        Math.max(padding, window.innerHeight - popoverRect.height - padding),
+    );
+
+    popover.style.setProperty('--aspect-vocalia-color-popover-left', `${Math.round(left)}px`);
+    popover.style.setProperty('--aspect-vocalia-color-popover-top', `${Math.round(top)}px`);
+}
+
+function closeVocaliaColorPickers(exceptControl = null) {
+    document.querySelectorAll('#aspect_vocalia_settings .aspect-vocalia-color-control.is-open').forEach(control => {
+        if (control === exceptControl) return;
+        control.classList.remove('is-open');
+    });
+}
+
+function initializeVocaliaColorWheels(root = document) {
+    root.querySelectorAll('canvas.aspect-vocalia-color-wheel').forEach(canvas => {
+        if (canvas.dataset.colorWheelRendered === 'true') return;
+        drawVocaliaColorWheel(canvas);
+        canvas.dataset.colorWheelRendered = 'true';
+    });
+}
+
+function bindVocaliaColorPickerControls() {
+    const root = document.getElementById('aspect_vocalia_settings');
+    if (!root || root.dataset.colorPickersBound === 'true') return;
+
+    initializeVocaliaColorWheels(root);
+
+    root.addEventListener('click', event => {
+        const swatch = event.target.closest('.aspect-vocalia-color-swatch');
+        const clearButton = event.target.closest('.aspect-vocalia-color-clear');
+
+        if (swatch) {
+            event.preventDefault();
+            event.stopPropagation();
+
+            const control = swatch.closest('.aspect-vocalia-color-control');
+            const willOpen = !control.classList.contains('is-open');
+
+            closeVocaliaColorPickers(control);
+
+            control.classList.toggle('is-open', willOpen);
+            initializeVocaliaColorWheels(control);
+
+            if (willOpen) {
+                positionVocaliaColorPopover(control);
+            }
+
+            return;
+        }
+
+        if (clearButton) {
+            event.preventDefault();
+            event.stopPropagation();
+
+            const settingKey = String(clearButton.getAttribute('data-color-clear') ?? '');
+            if (!settingKey) return;
+
+            setVocaliaSegmentColorSetting(settingKey, '');
+
+            return;
+        }
+
+        if (!event.target.closest('.aspect-vocalia-color-control')) {
+            closeVocaliaColorPickers();
+        }
+    }, true);
+
+    root.addEventListener('input', event => {
+        const input = event.target.closest('.aspect-vocalia-color-hex-input');
+        if (!input) return;
+
+        const settingKey = String(input.getAttribute('data-color-hex') ?? '');
+        if (!settingKey) return;
+
+        const normalized = normalizeOptionalHexColor(input.value);
+        if (!normalized && String(input.value ?? '').trim()) return;
+
+        setVocaliaSegmentColorSetting(settingKey, normalized);
+    });
+
+    root.addEventListener('change', event => {
+        const input = event.target.closest('.aspect-vocalia-color-hex-input');
+        if (!input) return;
+
+        const settingKey = String(input.getAttribute('data-color-hex') ?? '');
+        if (!settingKey) return;
+
+        const normalized = normalizeOptionalHexColor(input.value);
+        input.value = normalized;
+
+        setVocaliaSegmentColorSetting(settingKey, normalized);
+    });
+
+    root.addEventListener('pointerdown', event => {
+        const canvas = event.target.closest('canvas.aspect-vocalia-color-wheel');
+        if (!canvas) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        const settingKey = String(canvas.getAttribute('data-color-wheel') ?? '');
+        if (!settingKey) return;
+
+        const applyFromEvent = pointerEvent => {
+            const color = getVocaliaColorFromWheelEvent(canvas, pointerEvent);
+            if (!color) return;
+            setVocaliaSegmentColorSetting(settingKey, color);
+        };
+
+        applyFromEvent(event);
+
+        const pointerMove = pointerEvent => applyFromEvent(pointerEvent);
+        const pointerUp = () => {
+            document.removeEventListener('pointermove', pointerMove, true);
+            document.removeEventListener('pointerup', pointerUp, true);
+            document.removeEventListener('pointercancel', pointerUp, true);
+        };
+
+        document.addEventListener('pointermove', pointerMove, true);
+        document.addEventListener('pointerup', pointerUp, true);
+        document.addEventListener('pointercancel', pointerUp, true);
+    }, true);
+
+    document.addEventListener('click', event => {
+        if (event.target.closest('#aspect_vocalia_settings .aspect-vocalia-color-control')) return;
+        closeVocaliaColorPickers();
+    }, true);
+
+    window.addEventListener('resize', () => closeVocaliaColorPickers());
+    window.addEventListener('scroll', () => closeVocaliaColorPickers(), true);
+
+    root.dataset.colorPickersBound = 'true';
+}
+
 function renderVocaliaInfoTip(key, label = 'More information') {
     const helpText = VOCALIA_LABEL_HELP[key];
     if (!helpText) return '';
@@ -8403,6 +9087,7 @@ function addVocaliaInfoTipsToSettings() {
     appendVocaliaInfoTip(findVocaliaLabelByText('Restore Original Group Reply Strategy Automatically'), 'restore_strategy', 'Explain Strategy Restore');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Turn Flow'), 'turn_flow', 'Explain Turn Flow');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Automatic Turn Flow'), 'automatic_turn_flow', 'Explain Automatic Turn Flow');
     appendVocaliaInfoTip(findVocaliaLabelByText('Arrival Handling'), 'arrival_mode', 'Explain Arrival Handling');
     appendVocaliaInfoTip(findVocaliaLabelByText('On First Message, Trigger Character by Name Match'), 'first_name_match', 'Explain First Message Name Match');
     appendVocaliaInfoTip(findVocaliaLabelByText('If No Character Match on First Message'), 'first_fallback', 'Explain First Message Fallback');
@@ -8417,9 +9102,14 @@ function addVocaliaInfoTipsToSettings() {
     appendVocaliaInfoTip(findVocaliaLabelByText('Hide Character Name in Refined Message'), 'hide_character_name', 'Explain Character Name Display');
     appendVocaliaInfoTip(findVocaliaLabelByText('Hide Thoughts in Refined Message'), 'hide_thoughts', 'Explain Thought Display');
     appendVocaliaInfoTip(findVocaliaLabelByText('Wrap Dialogue in Quotes in Refined Message'), 'quote_dialogue', 'Explain Dialogue Quotes');
-    appendVocaliaInfoTip(findVocaliaLabelByText('Style for Actions'), 'action_style', 'Explain Action Style');
-    appendVocaliaInfoTip(findVocaliaLabelByText('Style for Narration'), 'narration_style', 'Explain Narration Style');
-    appendVocaliaInfoTip(findVocaliaLabelByText('Style for Thoughts'), 'thoughts_style', 'Explain Thought Style');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Dialogue Style'), 'dialogue_style', 'Explain Dialogue Style');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Narration Style'), 'narration_style', 'Explain Narration Style');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Actions Style'), 'action_style', 'Explain Action Style');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Thoughts Style'), 'thoughts_style', 'Explain Thought Style');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Dialogue Color'), 'dialogue_color', 'Explain Dialogue Color');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Narration Color'), 'narration_color', 'Explain Narration Color');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Actions Color'), 'action_color', 'Explain Actions Color');
+    appendVocaliaInfoTip(findVocaliaLabelByText('Thoughts Color'), 'thoughts_color', 'Explain Thoughts Color');
 
     appendVocaliaInfoTip(findVocaliaLabelByText('Protocol'), 'protocol', 'Explain Protocol');
     appendVocaliaInfoTip(findVocaliaLabelByText('Protocol Injection Depth'), 'prompt_depth', 'Explain Protocol Depth');
@@ -8650,30 +9340,63 @@ function clampVocaliaNumber(value, min, max) {
     return Math.min(Math.max(value, min), max);
 }
 
-function closeVocaliaPopups() {
-    $('.aspect-vocalia-popup')
-        .removeClass('aspect-vocalia-popup-open')
-        .css({
-            '--aspect-vocalia-popup-left': '',
-            '--aspect-vocalia-popup-top': '',
+function isEventInsideVocaliaPopupSystem(event) {
+    const path = typeof event?.composedPath === 'function'
+        ? event.composedPath()
+        : [];
+
+    const popupSystemSelectors = [
+        '#aspect_vocalia_settings .aspect-vocalia-popup-wrap',
+        '#aspect_vocalia_settings .aspect-vocalia-popup',
+        '#aspect_vocalia_settings .aspect-vocalia-popup-button',
+        '#aspect_vocalia_settings .aspect-vocalia-color-control',
+        '#aspect_vocalia_settings .aspect-vocalia-color-popover',
+        '#aspect_vocalia_tooltip_layer',
+    ].join(',');
+
+    if (path.some(node => node instanceof Element && node.matches?.(popupSystemSelectors))) {
+        return true;
+    }
+
+    const target = event?.target instanceof Element ? event.target : null;
+    return !!target?.closest?.(popupSystemSelectors);
+}
+
+function closeVocaliaPopups(exceptPopup = null) {
+    document
+        .querySelectorAll('#aspect_vocalia_settings .aspect-vocalia-popup.aspect-vocalia-popup-open')
+        .forEach(popup => {
+            if (exceptPopup && popup === exceptPopup) return;
+
+            popup.classList.remove('aspect-vocalia-popup-open');
+            popup.style.removeProperty('--aspect-vocalia-popup-left');
+            popup.style.removeProperty('--aspect-vocalia-popup-top');
+        });
+
+    document
+        .querySelectorAll('#aspect_vocalia_settings .aspect-vocalia-popup-button[aria-expanded="true"]')
+        .forEach(button => {
+            const controlledId = button.getAttribute('aria-controls');
+
+            if (exceptPopup && controlledId && exceptPopup.id === controlledId) return;
+
+            button.setAttribute('aria-expanded', 'false');
         });
 }
 
 function positionVocaliaPopupInViewport($popup, button) {
     const popupElement = $popup?.[0];
 
-    if (!popupElement || !button) return;
+    if (!popupElement || !(button instanceof Element)) return;
 
     const margin = 8;
     const buttonRect = button.getBoundingClientRect();
 
-    $popup.css({
-        '--aspect-vocalia-popup-left': `${margin}px`,
-        '--aspect-vocalia-popup-top': `${margin}px`,
-    });
+    popupElement.style.setProperty('--aspect-vocalia-popup-left', `${margin}px`);
+    popupElement.style.setProperty('--aspect-vocalia-popup-top', `${margin}px`);
 
     requestAnimationFrame(() => {
-        if (!$popup.hasClass('aspect-vocalia-popup-open')) return;
+        if (!popupElement.classList.contains('aspect-vocalia-popup-open')) return;
 
         const popupWidth = Math.min(popupElement.offsetWidth || 260, window.innerWidth - (margin * 2));
         const popupHeight = Math.min(popupElement.offsetHeight || 0, window.innerHeight - (margin * 2));
@@ -8690,23 +9413,34 @@ function positionVocaliaPopupInViewport($popup, button) {
 
         top = clampVocaliaNumber(top, margin, maxTop);
 
-        $popup.css({
-            '--aspect-vocalia-popup-left': `${left}px`,
-            '--aspect-vocalia-popup-top': `${top}px`,
-        });
+        popupElement.style.setProperty('--aspect-vocalia-popup-left', `${Math.round(left)}px`);
+        popupElement.style.setProperty('--aspect-vocalia-popup-top', `${Math.round(top)}px`);
     });
 }
 
 function toggleVocaliaPopup(button, popupSelector) {
-    const $popup = $(popupSelector);
-    const wasOpen = $popup.hasClass('aspect-vocalia-popup-open');
+    const popup = document.querySelector(popupSelector);
+    if (!popup) return;
 
-    closeVocaliaPopups();
+    const wasOpen = popup.classList.contains('aspect-vocalia-popup-open');
 
-    if (!wasOpen) {
-        $popup.addClass('aspect-vocalia-popup-open');
-        positionVocaliaPopupInViewport($popup, button);
+    closeVocaliaPopups(popup);
+
+    if (wasOpen) {
+        popup.classList.remove('aspect-vocalia-popup-open');
+        popup.style.removeProperty('--aspect-vocalia-popup-left');
+        popup.style.removeProperty('--aspect-vocalia-popup-top');
+        button?.setAttribute?.('aria-expanded', 'false');
+        return;
     }
+
+    if (button instanceof Element) {
+        if (popup.id) button.setAttribute('aria-controls', popup.id);
+        button.setAttribute('aria-expanded', 'true');
+    }
+
+    popup.classList.add('aspect-vocalia-popup-open');
+    positionVocaliaPopupInViewport($(popup), button);
 }
 
 function stopVocaliaPopupEvent(event) {
@@ -9036,6 +9770,7 @@ async function resetVocaliaExtension() {
 // - Move Presence Required for Message Recall into its own Memory section.
 // - Keep Status popup button on its own line under the Status header.
 // - Bind all controls to settings, diagnostics, popups, and utilities.
+// - Render dialogue/action/narration/thought style controls with color pickers.
 // ============================================================================
 
 function injectSettingsUi() {
@@ -9134,13 +9869,18 @@ function injectSettingsUi() {
                         <div class="aspect-vocalia-section-title">Turn Flow</div>
 
                         <div class="flex-container flexFlowColumn">
+                            <label class="checkbox_label">
+                                <input id="av_auto_turn_flow" type="checkbox">
+                                <span class="aspect-vocalia-label-text">Automatic Turn Flow</span>
+                            </label>
+
                             <label for="av_arrival_mode" class="aspect-vocalia-label">Arrival Handling</label>
                             <select id="av_arrival_mode" class="text_pole">
                                 <option value="${ARRIVAL_APPLY_IMMEDIATE}">Immediately</option>
                                 <option value="${ARRIVAL_APPLY_DEFERRED}">Delayed</option>
                             </select>
 
-                            <label for="av_first_fallback" class="aspect-vocalia-label">First Message, Nameless Behavior</label>
+                            <label for="av_first_fallback" class="aspect-vocalia-label">If No Character Match on First Message</label>
                             <select id="av_first_fallback" class="text_pole">
                                 <option value="${FIRST_MESSAGE_FALLBACK_RANDOM_PRESENT}">Trigger a Random Eligible Participant</option>
                                 <option value="${FIRST_MESSAGE_FALLBACK_FIRST_PRESENT}">Trigger First Eligible Participant</option>
@@ -9149,7 +9889,7 @@ function injectSettingsUi() {
 							
 							<label class="checkbox_label">
                                 <input id="av_first_name_match" type="checkbox">
-                                <span class="aspect-vocalia-label-text">First Message, Trigger by Name Match</span>
+                                <span class="aspect-vocalia-label-text">On First Message, Trigger Character by Name Match</span>
                             </label>
 
                             <div class="flex-container flexFlowColumn">
@@ -9187,13 +9927,8 @@ function injectSettingsUi() {
                             </label>
 
                             <label class="checkbox_label">
-                                <input id="av_hide_empty_sections" type="checkbox">
-                                <span class="aspect-vocalia-label-text">Hide Empty Block Tags</span>
-                            </label>
-
-                            <label class="checkbox_label">
                                 <input id="av_hide_character_name" type="checkbox">
-                                <span class="aspect-vocalia-label-text">Hide Character Label in Refined Message</span>
+                                <span class="aspect-vocalia-label-text">Hide Character Name in Refined Message</span>
                             </label>
 
                             <label class="checkbox_label">
@@ -9206,20 +9941,37 @@ function injectSettingsUi() {
                                 <span class="aspect-vocalia-label-text">Wrap Dialogue in Quotes in Refined Message</span>
                             </label>
 
-                            <label for="av_action_style" class="aspect-vocalia-label">Style for Actions</label>
-                            <select id="av_action_style" class="text_pole">
-                                ${renderOverlayStyleOptions(getSettings().actionDisplayStyle)}
-                            </select>
+                            <label for="av_dialogue_style" class="aspect-vocalia-label">Dialogue Style</label>
+                            <div class="aspect-vocalia-style-control-row">
+                                ${renderVocaliaColorPickerControl('dialogueTextColor', 'av_dialogue_color')}
+                                <select id="av_dialogue_style" class="text_pole">
+                                    ${renderOverlayStyleOptions(getSettings().dialogueDisplayStyle)}
+                                </select>
+                            </div>
 
-                            <label for="av_narration_style" class="aspect-vocalia-label">Style for Narration</label>
-                            <select id="av_narration_style" class="text_pole">
-                                ${renderOverlayStyleOptions(getSettings().narrationDisplayStyle)}
-                            </select>
+                            <label for="av_action_style" class="aspect-vocalia-label">Actions Style</label>
+                            <div class="aspect-vocalia-style-control-row">
+                                ${renderVocaliaColorPickerControl('actionTextColor', 'av_action_color')}
+                                <select id="av_action_style" class="text_pole">
+                                    ${renderOverlayStyleOptions(getSettings().actionDisplayStyle)}
+                                </select>
+                            </div>
 
-                            <label for="av_thoughts_style" class="aspect-vocalia-label">Style for Thoughts</label>
-                            <select id="av_thoughts_style" class="text_pole">
-                                ${renderOverlayStyleOptions(getSettings().thoughtsDisplayStyle)}
-                            </select>
+                            <label for="av_narration_style" class="aspect-vocalia-label">Narration Style</label>
+                            <div class="aspect-vocalia-style-control-row">
+                                ${renderVocaliaColorPickerControl('narrationTextColor', 'av_narration_color')}
+                                <select id="av_narration_style" class="text_pole">
+                                    ${renderOverlayStyleOptions(getSettings().narrationDisplayStyle)}
+                                </select>
+                            </div>
+
+                            <label for="av_thoughts_style" class="aspect-vocalia-label">Thoughts Style</label>
+                            <div class="aspect-vocalia-style-control-row">
+                                ${renderVocaliaColorPickerControl('thoughtsTextColor', 'av_thoughts_color')}
+                                <select id="av_thoughts_style" class="text_pole">
+                                    ${renderOverlayStyleOptions(getSettings().thoughtsDisplayStyle)}
+                                </select>
+                            </div>
                         </div>
                     </div>
 
@@ -9346,6 +10098,7 @@ function injectSettingsUi() {
 
     addVocaliaInfoTipsToSettings();
     setupVocaliaInfoTooltips();
+    bindVocaliaColorPickerControls();
 
     bindSettingsUi();
 }
@@ -9358,6 +10111,7 @@ function loadSettingsUi() {
     $('#av_restore_strategy').prop('checked', !!settings.restoreOriginalStrategyOnDisable);
     $('#av_occlude_history').prop('checked', !!settings.occludeUnwitnessedHistory);
 
+    $('#av_auto_turn_flow').prop('checked', settings.autoTurnFlow !== false);
     $('#av_arrival_mode').val(settings.arrivalApplyMode);
     $('#av_first_name_match').prop('checked', !!settings.triggerNamedCharacterOnFirstUserMessage);
     $('#av_first_fallback').val(settings.firstMessageFallback);
@@ -9368,14 +10122,19 @@ function loadSettingsUi() {
     $('#av_trigger_delay').val(formatDelaySeconds(settings.triggerDelayMs));
 
     $('#av_render_overlay').prop('checked', !!settings.renderOverlay);
-    $('#av_hide_empty_sections').prop('checked', !!settings.hideEmptySections);
     $('#av_hide_character_name').prop('checked', getRefinedMessageCharacterNameHidden(settings));
     $('#av_hide_thoughts').prop('checked', getRefinedMessageThoughtsHidden(settings));
     $('#av_quote_dialogue').prop('checked', !!settings.quoteDialogue);
 
+    $('#av_dialogue_style').val(normalizeOverlayStyle(settings.dialogueDisplayStyle));
     $('#av_action_style').val(normalizeOverlayStyle(settings.actionDisplayStyle));
     $('#av_narration_style').val(normalizeOverlayStyle(settings.narrationDisplayStyle));
     $('#av_thoughts_style').val(normalizeOverlayStyle(settings.thoughtsDisplayStyle));
+
+    syncVocaliaColorPickerControl('dialogueTextColor');
+    syncVocaliaColorPickerControl('actionTextColor');
+    syncVocaliaColorPickerControl('narrationTextColor');
+    syncVocaliaColorPickerControl('thoughtsTextColor');
 
     $('#av_prompt_depth').val(String(settings.promptDepth));
     $('#av_hide_debug_toasts').prop('checked', getDebugToastsHidden(settings));
@@ -9443,6 +10202,17 @@ function bindSettingsUi() {
     bindCheckbox('#av_auto_manual', 'autoSetManual', async () => forceManualStrategyForCurrentGroup());
     bindCheckbox('#av_restore_strategy', 'restoreOriginalStrategyOnDisable');
 
+    bindCheckbox('#av_auto_turn_flow', 'autoTurnFlow', async () => {
+        if (getSettings().autoTurnFlow === false) {
+            triggerQueue = [];
+            queueRunning = false;
+        }
+
+        updateDiagnosticsPanel();
+        updateExtensionPrompt();
+        await saveMetadata();
+    });
+
     bindPlainSelect('#av_arrival_mode', 'arrivalApplyMode', async () => {
         if (getSettings().arrivalApplyMode === ARRIVAL_APPLY_IMMEDIATE) {
             applyPendingArrivals();
@@ -9468,8 +10238,6 @@ function bindSettingsUi() {
         applyOverlaySettingToVisibleMessages();
     });
 
-    bindCheckbox('#av_hide_empty_sections', 'hideEmptySections', async () => renderAllVisibleOverlays());
-
     $('#av_hide_character_name').on('change', async function () {
         setInvertedBooleanSetting('hideCharacterNameInRefinedMessage', 'showCharacterLabels', !!$(this).prop('checked'));
         await renderAllVisibleOverlays();
@@ -9482,6 +10250,7 @@ function bindSettingsUi() {
 
     bindCheckbox('#av_quote_dialogue', 'quoteDialogue', async () => renderAllVisibleOverlays());
 
+    bindSelect('#av_dialogue_style', 'dialogueDisplayStyle', async () => renderAllVisibleOverlays());
     bindSelect('#av_action_style', 'actionDisplayStyle', async () => renderAllVisibleOverlays());
     bindSelect('#av_narration_style', 'narrationDisplayStyle', async () => renderAllVisibleOverlays());
     bindSelect('#av_thoughts_style', 'thoughtsDisplayStyle', async () => renderAllVisibleOverlays());
@@ -9512,28 +10281,18 @@ function bindSettingsUi() {
         toggleVocaliaPopup(this, '#aspect_vocalia_protocol_popup');
     });
 
-    $('#aspect_vocalia_settings').on('click', '.aspect-vocalia-popup', function (event) {
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-    });
+    $('#aspect_vocalia_settings')
+        .off('.aspectVocaliaPopupShield');
 
     $(document)
-        .off('click.aspectVocaliaPopups')
-        .on('click.aspectVocaliaPopups', function (event) {
-            const $target = $(event.target);
-
-            if ($target.closest('#aspect_vocalia_settings .aspect-vocalia-popup-wrap').length) {
-                return;
-            }
-
+        .off('pointerdown.aspectVocaliaPopups')
+        .on('pointerdown.aspectVocaliaPopups', function (event) {
+            if (isEventInsideVocaliaPopupSystem(event)) return;
             closeVocaliaPopups();
         });
 
     $(window)
-        .off('resize.aspectVocaliaPopups scroll.aspectVocaliaPopups')
-        .on('resize.aspectVocaliaPopups scroll.aspectVocaliaPopups', () => {
-            closeVocaliaPopups();
-        });
+        .off('resize.aspectVocaliaPopups scroll.aspectVocaliaPopups');
 
     $('#aspect_vocalia_member_state_table').on('change', '.aspect_vocalia_member_status_select', async function () {
         const avatar = String($(this).attr('data-avatar') ?? '');
@@ -9631,6 +10390,7 @@ function bindSettingsUi() {
     });
 
     bindProtocolInjectionEditorUi();
+    bindVocaliaColorPickerControls();
     loadSettingsUi();
 }
 
@@ -9793,7 +10553,7 @@ async function init() {
     if (initialized) return;
     initialized = true;
 
-    injectStyles();
+    installStyles();
     injectSettingsUi();
     bindEvents();
 
