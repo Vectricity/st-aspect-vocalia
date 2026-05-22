@@ -14,7 +14,11 @@ import {
     saveSettingsDebounced as importedSaveSettingsDebounced,
     deleteLastMessage as importedDeleteLastMessage,
 } from '../../../../script.js';
-import { getContext as importedGetContext } from '../../../extensions.js';
+import {
+    extension_settings as importedExtensionSettings,
+    findExtension as importedFindExtension,
+    getContext as importedGetContext,
+} from '../../../extensions.js';
 
 // ============================================================================
 // Section 2. Module Constants and State
@@ -28,6 +32,15 @@ import { getContext as importedGetContext } from '../../../extensions.js';
 const MODULE_NAME = 'aspect_vocalia';
 const MODULE_DISPLAY_NAME = 'Aspect: Vocalia';
 const LEGACY_MODULE_NAMES = ['group_speaker_router'];
+
+const DIALOGUE_COLORIZER_EXTENSION_NAME = 'SillyTavern-Smart-Dialogue-Colorizer';
+const DIALOGUE_COLORIZER_EXTENSION_FULL_NAME = `third-party/${DIALOGUE_COLORIZER_EXTENSION_NAME}`;
+const DIALOGUE_COLORIZER_SETTINGS_ELEMENT_ID = 'sdc-extension-settings';
+const DIALOGUE_COLORIZER_CHARACTER_STYLE_ID = 'sdc-chars_style_sheet';
+const DIALOGUE_COLORIZER_PERSONA_STYLE_ID = 'sdc-personas_style_sheet';
+const DIALOGUE_COLORIZER_AUTHOR_UID_ATTRIBUTE = 'sdc-author_uid';
+const DIALOGUE_COLORIZER_CHARACTER_TYPE = 'character';
+const DIALOGUE_COLORIZER_PERSONA_TYPE = 'persona';
 
 const GROUP_ACTIVATION_MANUAL = 2;
 const EXTENSION_PROMPT_POSITION_IN_CHAT = 1;
@@ -173,6 +186,7 @@ let queueRunning = false;
 let triggerQueue = [];
 let mutationObserver = null;
 let styleElement = null;
+let vocaliaDialogueColorizerObserver = null;
 let vocaliaManifestMeta = {
     version: '0.0.0',
     author: 'Genisai',
@@ -590,20 +604,96 @@ function normalizeOverlayStyle(style) {
     return allowed.has(value) ? value : OVERLAY_STYLE_PLAIN;
 }
 
+function clampColorByte(value, fallback = 0) {
+    const number = Number(value);
+    const safe = Number.isFinite(number) ? Math.round(number) : fallback;
+    return Math.min(255, Math.max(0, safe));
+}
+
+function clampColorUnit(value, fallback = 1) {
+    const number = Number(value);
+    const safe = Number.isFinite(number) ? number : fallback;
+    return Math.min(1, Math.max(0, safe));
+}
+
+function formatCssAlpha(value) {
+    const alpha = clampColorUnit(value, 1);
+    if (alpha >= 1) return '1';
+    if (alpha <= 0) return '0';
+    return alpha.toFixed(3).replace(/0+$/g, '').replace(/\.$/g, '');
+}
+
+function parseVocaliaHexColor(value) {
+    const text = String(value ?? '').trim();
+    const match = /^#?([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.exec(text);
+    if (!match) return null;
+
+    let hex = match[1].toLowerCase();
+
+    if (hex.length === 3 || hex.length === 4) {
+        hex = hex.split('').map(character => `${character}${character}`).join('');
+    }
+
+    const hasAlpha = hex.length === 8;
+
+    return {
+        r: parseInt(hex.slice(0, 2), 16),
+        g: parseInt(hex.slice(2, 4), 16),
+        b: parseInt(hex.slice(4, 6), 16),
+        a: hasAlpha ? parseInt(hex.slice(6, 8), 16) / 255 : 1,
+    };
+}
+
+function parseVocaliaRgbColor(value) {
+    const text = String(value ?? '').trim();
+    const match = /^rgba?\((.+)\)$/i.exec(text);
+    if (!match) return null;
+
+    const parts = match[1]
+        .replace('/', ',')
+        .split(/[,\s]+/)
+        .map(part => part.trim())
+        .filter(Boolean);
+
+    if (parts.length < 3) return null;
+
+    const alphaText = parts[3] ?? '1';
+    const alpha = alphaText.endsWith('%')
+        ? Number.parseFloat(alphaText) / 100
+        : Number.parseFloat(alphaText);
+
+    return {
+        r: clampColorByte(parts[0]),
+        g: clampColorByte(parts[1]),
+        b: clampColorByte(parts[2]),
+        a: clampColorUnit(alpha, 1),
+    };
+}
+
+function parseVocaliaColorValue(value) {
+    return parseVocaliaHexColor(value) ?? parseVocaliaRgbColor(value);
+}
+
+function formatVocaliaColorValue(color) {
+    if (!color) return '';
+
+    const r = clampColorByte(color.r);
+    const g = clampColorByte(color.g);
+    const b = clampColorByte(color.b);
+    const a = clampColorUnit(color.a, 1);
+
+    if (a >= 0.999) {
+        return `#${[r, g, b].map(component => component.toString(16).padStart(2, '0')).join('')}`;
+    }
+
+    return `rgba(${r}, ${g}, ${b}, ${formatCssAlpha(a)})`;
+}
+
 function normalizeOptionalHexColor(value) {
     const text = String(value ?? '').trim();
     if (!text) return '';
 
-    const match = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(text);
-    if (!match) return '';
-
-    const hex = match[1].toLowerCase();
-
-    if (hex.length === 3) {
-        return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`;
-    }
-
-    return `#${hex}`;
+    return formatVocaliaColorValue(parseVocaliaColorValue(text));
 }
 
 function getSegmentColorSettingKey(segmentType) {
@@ -4130,11 +4220,167 @@ function shouldShowRefinedThoughts(settings = getSettings()) {
     return !!settings.showThoughts;
 }
 
+function getDialogueColorizerExtensionState() {
+    const found = typeof importedFindExtension === 'function'
+        ? importedFindExtension(DIALOGUE_COLORIZER_EXTENSION_NAME)
+        : null;
+
+    const disabledExtensions = Array.isArray(importedExtensionSettings?.disabledExtensions)
+        ? importedExtensionSettings.disabledExtensions
+        : [];
+
+    const enabledBySillyTavern = found
+        ? !!found.enabled
+        : (
+            !disabledExtensions.includes(DIALOGUE_COLORIZER_EXTENSION_NAME)
+            && !disabledExtensions.includes(DIALOGUE_COLORIZER_EXTENSION_FULL_NAME)
+        );
+
+    const hasSettingsUi = !!document.getElementById(DIALOGUE_COLORIZER_SETTINGS_ELEMENT_ID);
+    const hasRuntimeStyleSheet = (
+        !!document.getElementById(DIALOGUE_COLORIZER_CHARACTER_STYLE_ID)
+        || !!document.getElementById(DIALOGUE_COLORIZER_PERSONA_STYLE_ID)
+    );
+
+    return {
+        installed: !!found || hasSettingsUi || hasRuntimeStyleSheet,
+        enabled: enabledBySillyTavern,
+        active: enabledBySillyTavern && hasSettingsUi && hasRuntimeStyleSheet,
+    };
+}
+
+function isDialogueColorizerActive() {
+    return getDialogueColorizerExtensionState().active;
+}
+
+function getDomElement(value) {
+    if (value instanceof Element) return value;
+    if (value?.[0] instanceof Element) return value[0];
+    return null;
+}
+
+function getDialogueColorizerAvatarNameFromImageSrc(characterType, imageSrc) {
+    const split = String(imageSrc ?? '').split('/').pop() ?? '';
+    if (!split) return '';
+
+    switch (characterType) {
+        case DIALOGUE_COLORIZER_CHARACTER_TYPE: {
+            const match = /\?type=avatar&file=(.*)/i.exec(split)?.[1];
+            return match ? decodeURIComponent(match) : split;
+        }
+
+        case DIALOGUE_COLORIZER_PERSONA_TYPE:
+            return split;
+
+        default:
+            return '';
+    }
+}
+
+function getDialogueColorizerAuthorUidFromMessageElement(messageElement) {
+    const element = getDomElement(messageElement);
+    if (!element) return '';
+
+    const existingUid = element.getAttribute(DIALOGUE_COLORIZER_AUTHOR_UID_ATTRIBUTE);
+    if (existingUid) return existingUid;
+
+    const avatarImage = element.querySelector('.mesAvatarWrapper > .avatar > img');
+    const avatarSrc = avatarImage?.getAttribute('src') ?? '';
+    if (!avatarSrc) return '';
+
+    const isUser = element.getAttribute('is_user') === 'true';
+    const isSystem = (
+        element.getAttribute('is_system') === 'true'
+        || avatarSrc === 'img/five.png'
+        || avatarSrc.endsWith('/img/five.png')
+    );
+
+    if (isSystem) return '';
+
+    const characterType = isUser
+        ? DIALOGUE_COLORIZER_PERSONA_TYPE
+        : DIALOGUE_COLORIZER_CHARACTER_TYPE;
+
+    const avatarName = getDialogueColorizerAvatarNameFromImageSrc(characterType, avatarSrc);
+    return avatarName ? `${characterType}|${avatarName}` : '';
+}
+
+function ensureDialogueColorizerAuthorUid(messageElement) {
+    if (!isDialogueColorizerActive()) return;
+
+    const element = getDomElement(messageElement);
+    if (!element || element.hasAttribute(DIALOGUE_COLORIZER_AUTHOR_UID_ATTRIBUTE)) return;
+
+    const uid = getDialogueColorizerAuthorUidFromMessageElement(element);
+    if (uid) element.setAttribute(DIALOGUE_COLORIZER_AUTHOR_UID_ATTRIBUTE, uid);
+}
+
+function getDialogueColorizerColorMap() {
+    const map = new Map();
+    const styleElements = [
+        document.getElementById(DIALOGUE_COLORIZER_CHARACTER_STYLE_ID),
+        document.getElementById(DIALOGUE_COLORIZER_PERSONA_STYLE_ID),
+    ].filter(Boolean);
+
+    const ruleRegex = /\.mes\[sdc-author_uid=(?:"([^"]+)"|'([^']+)')\]\s*\{[\s\S]*?--character-color:\s*(#[0-9a-fA-F]{3,8})\s*;/g;
+
+    for (const styleElement of styleElements) {
+        const cssText = String(styleElement.textContent ?? '');
+        let match;
+
+        while ((match = ruleRegex.exec(cssText)) !== null) {
+            const uid = match[1] || match[2] || '';
+            const color = normalizeOptionalHexColor(match[3]);
+            if (uid && color) map.set(uid, color);
+        }
+    }
+
+    return map;
+}
+
+function getDialogueColorizerUidForBlock(block, messageId) {
+    const member = getMemberByName(block?.name, getGroupMembers());
+    if (member?.avatar) return `${DIALOGUE_COLORIZER_CHARACTER_TYPE}|${member.avatar}`;
+
+    const { messageElement, exists } = getMessageElementAndTextElement(messageId);
+    if (!exists) return '';
+
+    return getDialogueColorizerAuthorUidFromMessageElement(messageElement);
+}
+
+function getDialogueColorizerColorForBlock(block, messageId) {
+    if (!isDialogueColorizerActive()) return '';
+
+    const uid = getDialogueColorizerUidForBlock(block, messageId);
+    if (!uid) return '';
+
+    return getDialogueColorizerColorMap().get(uid) ?? '';
+}
+
+function createOverlayElement(className, text, tagName = 'span') {
+    const element = document.createElement(tagName);
+    element.className = className;
+    element.textContent = text;
+    return element;
+}
+
 function createOverlaySpan(className, text) {
-    const span = document.createElement('span');
-    span.className = className;
-    span.textContent = text;
-    return span;
+    return createOverlayElement(className, text, 'span');
+}
+
+function createDialogueColorizerQuoteElement(className, text, dialogueColor = '') {
+    const quote = createOverlayElement(
+        `${className} aspect-vocalia-dialogue-colorizer-target`,
+        text,
+        'q',
+    );
+
+    const normalizedColor = normalizeOptionalHexColor(dialogueColor);
+    if (normalizedColor) {
+        quote.style.setProperty('--character-color', normalizedColor);
+    }
+
+    return quote;
 }
 
 function createFormattedSegmentElement(className, displayText, message, messageId, fallbackText = displayText) {
@@ -4219,8 +4465,13 @@ function appendStyledSegment(parent, segment, message, messageId, segmentClassNa
 
     if (!cleanText) return;
 
+    const useDialogueColorizer = segment.type === SEGMENT_DIALOGUE && isDialogueColorizerActive();
     const displayText = options.wrapInQuotes ? `"${cleanText}"` : buildStyledSegmentDisplayText(cleanText, normalizedStyle);
-    const paragraph = createSegmentParagraph(segment.type, normalizedStyle, options.textColor);
+    const paragraph = createSegmentParagraph(
+        segment.type,
+        normalizedStyle,
+        useDialogueColorizer ? '' : options.textColor,
+    );
 
     if (shouldUseSillyTavernFormattingForSegment(segment.type, normalizedStyle, options.wrapInQuotes)) {
         const formattedText = normalizedStyle === OVERLAY_STYLE_ASTERISKS && !options.wrapInQuotes
@@ -4233,6 +4484,12 @@ function appendStyledSegment(parent, segment, message, messageId, segmentClassNa
             message,
             messageId,
             cleanText,
+        ));
+    } else if (useDialogueColorizer) {
+        paragraph.append(createDialogueColorizerQuoteElement(
+            segmentClassName,
+            displayText,
+            options.dialogueColorizerTextColor,
         ));
     } else {
         paragraph.append(createOverlaySpan(segmentClassName, displayText));
@@ -4259,6 +4516,7 @@ function appendSegmentElement(parent, segment, block, message, messageId) {
                     stripDialogueQuotes: true,
                     wrapInQuotes: !!settings.quoteDialogue,
                     textColor: settings.dialogueTextColor,
+                    dialogueColorizerTextColor: getDialogueColorizerColorForBlock(block, messageId),
                 },
             );
             break;
@@ -4388,6 +4646,8 @@ function renderMessageOverlay(messageId) {
 
     const { messageElement, textElement, exists } = getMessageElementAndTextElement(messageId);
     if (!exists) return;
+
+    ensureDialogueColorizerAuthorUid(messageElement);
 
     const fragment = createStructuredOverlayFragment(message, messageId);
     if (!fragment) {
@@ -8123,6 +8383,52 @@ function installStyles() {
             margin-bottom: 0.65em;
         }
 
+        #aspect_vocalia_settings .aspect-vocalia-critical-box {
+            border: 1px solid rgba(183, 110, 121, 0.65);
+            outline: 1px solid rgba(183, 110, 121, 0.65);
+            outline-offset: 2px;
+            border-radius: 12px;
+            padding: 10px;
+            margin: 10px 0 14px;
+            background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.08));
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-box > .aspect-vocalia-section-title {
+            margin-top: 0;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-enable-row,
+        #aspect_vocalia_settings .aspect-vocalia-critical-button-row {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.45em;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-enable-row {
+            align-items: flex-start;
+            margin-bottom: 10px;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-critical-button-row > *,
+        #aspect_vocalia_settings .aspect-vocalia-control-with-tip,
+        #aspect_vocalia_settings .aspect-vocalia-popup-wrap {
+            flex: 0 0 auto;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-control-with-tip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        #aspect_vocalia_settings button,
+        #aspect_vocalia_settings input[type="button"] {
+            width: auto;
+            min-width: max-content;
+            white-space: nowrap;
+        }
+
         #aspect_vocalia_settings .aspect-vocalia-label,
         #aspect_vocalia_settings .aspect-vocalia-label-text {
             display: inline-flex;
@@ -8328,12 +8634,15 @@ function installStyles() {
             position: fixed;
             z-index: 2147483645;
             display: none;
-            grid-template-columns: auto auto;
+            grid-template-columns: auto minmax(9rem, 1fr);
+            grid-template-areas:
+                "wheel inputs"
+                "default default";
             gap: 0.55em;
-            align-items: center;
+            align-items: start;
             left: var(--aspect-vocalia-color-popover-left, 8px);
             top: var(--aspect-vocalia-color-popover-top, 8px);
-            padding: 0.7em;
+            padding: 2.25em 0.7em 0.7em;
             border: 1px solid var(--SmartThemeBorderColor);
             border-radius: 10px;
             background: var(--SmartThemeBlurTintColor, rgba(28, 28, 28, 1));
@@ -8344,24 +8653,131 @@ function installStyles() {
             display: grid;
         }
 
-        #aspect_vocalia_settings .aspect-vocalia-native-color-picker {
-            width: 92px;
-            height: 92px;
-            padding: 0;
-            border: none;
+        #aspect_vocalia_settings .aspect-vocalia-color-wheel-wrap {
+            grid-area: wheel;
+            position: relative;
+            width: 132px;
+            height: 132px;
+            align-self: center;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-wheel {
+            width: 132px;
+            height: 132px;
             border-radius: 999px;
-            overflow: hidden;
-            cursor: pointer;
-            background: transparent;
+            cursor: crosshair;
+            touch-action: none;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-preview {
+            position: absolute;
+            left: 7px;
+            top: 7px;
+            width: 0.8em;
+            height: 0.8em;
+            border: 1px solid var(--SmartThemeBorderColor);
+            border-radius: 999px;
+            background:
+                linear-gradient(45deg, rgba(127,127,127,0.35) 25%, transparent 25%),
+                linear-gradient(-45deg, rgba(127,127,127,0.35) 25%, transparent 25%),
+                linear-gradient(45deg, transparent 75%, rgba(127,127,127,0.35) 75%),
+                linear-gradient(-45deg, transparent 75%, rgba(127,127,127,0.35) 75%);
+            background-size: 6px 6px;
+            background-position: 0 0, 0 3px, 3px -3px, -3px 0;
+            box-shadow:
+                inset 0 0 0 999px var(--aspect-vocalia-preview-color, transparent),
+                0 0 0 1px rgba(0, 0, 0, 0.45);
+            pointer-events: none;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-close {
+            position: absolute;
+            top: 0.45em;
+            right: 0.45em;
+            width: 1.75em;
+            min-width: 1.75em;
+            height: 1.75em;
+            padding: 0;
+            line-height: 1;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-inputs {
+            grid-area: inputs;
+            display: grid;
+            gap: 0.45em;
+            min-width: 9rem;
+            align-self: center;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-field {
+            display: grid;
+            grid-template-columns: 5.8em minmax(0, 1fr) auto;
+            gap: 0.4em;
+            align-items: center;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-field-label {
+            opacity: 0.9;
+            font-size: 0.9em;
+            white-space: nowrap;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-number-input {
+            width: 4.8em;
+            text-align: right;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-color-hex-input {
-            width: 96px;
+            width: 7.5em;
             font-family: var(--monoFontFamily, monospace);
+            text-transform: uppercase;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-unit {
+            opacity: 0.75;
+            white-space: nowrap;
         }
 
         #aspect_vocalia_settings .aspect-vocalia-color-clear {
-            grid-column: 1 / -1;
+            grid-area: default;
+            justify-self: center;
+            min-width: 8em;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-control-disabled-by-dialogue-colorizer {
+            opacity: 0.82;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-control-disabled-by-dialogue-colorizer .aspect-vocalia-color-swatch {
+            position: relative;
+            cursor: not-allowed;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-control-disabled-by-dialogue-colorizer .aspect-vocalia-color-swatch::before,
+        #aspect_vocalia_settings .aspect-vocalia-color-control-disabled-by-dialogue-colorizer .aspect-vocalia-color-swatch::after {
+            content: '';
+            position: absolute;
+            left: 12%;
+            right: 12%;
+            top: 50%;
+            height: 2px;
+            border-radius: 999px;
+            background: #ff3333;
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+            transform-origin: center;
+            pointer-events: none;
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-control-disabled-by-dialogue-colorizer .aspect-vocalia-color-swatch::before {
+            transform: rotate(45deg);
+        }
+
+        #aspect_vocalia_settings .aspect-vocalia-color-control-disabled-by-dialogue-colorizer .aspect-vocalia-color-swatch::after {
+            transform: rotate(-45deg);
         }
 
         #aspect_vocalia_settings .aspect-vocalia-info-tooltip {
@@ -8469,6 +8885,15 @@ function installStyles() {
         }
 
         .aspect-vocalia-segment-dialogue { font-style: normal; }
+
+        #chat q.aspect-vocalia-dialogue-colorizer-target {
+            quotes: none;
+        }
+
+        #chat q.aspect-vocalia-dialogue-colorizer-target::before,
+        #chat q.aspect-vocalia-dialogue-colorizer-target::after {
+            content: '';
+        }
 
         .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_ITALIC}"] { font-style: italic; }
         .aspect-vocalia-segment[data-display-style="${OVERLAY_STYLE_BOLD}"] { font-weight: 700; }
@@ -8702,43 +9127,107 @@ function bindProtocolInjectionEditorUi() {
 
 function renderVocaliaColorPickerControl(settingKey, inputId) {
     const settings = getSettings();
-    const value = normalizeOptionalHexColor(settings[settingKey]);
+    const storedValue = normalizeOptionalHexColor(settings[settingKey]);
+    const disabledByDialogueColorizer = settingKey === 'dialogueTextColor' && isDialogueColorizerActive();
+    const model = getVocaliaColorPickerModelFromValue(disabledByDialogueColorizer ? '' : storedValue);
     const safeSettingKey = escapeHtml(settingKey);
     const safeInputId = escapeHtml(inputId);
-    const swatchStyle = value ? ` style="background-color: ${escapeHtml(value)}"` : '';
+    const safeColor = escapeHtml(disabledByDialogueColorizer ? '' : storedValue);
+    const swatchStyle = safeColor ? ` style="background-color: ${safeColor}"` : '';
+    const controlClass = disabledByDialogueColorizer
+        ? 'aspect-vocalia-color-control aspect-vocalia-color-control-disabled-by-dialogue-colorizer'
+        : 'aspect-vocalia-color-control';
+    const disabledAttribute = disabledByDialogueColorizer ? ' disabled aria-disabled="true"' : '';
+    const swatchTitle = disabledByDialogueColorizer
+        ? 'Smart Dialogue Colorizer is active. Vocalia dialogue color is disabled and Smart Dialogue Colorizer controls dialogue colors.'
+        : safeColor ? `Current color: ${safeColor}` : 'Theme default color';
 
     return `
-        <span class="aspect-vocalia-color-control" data-color-setting="${safeSettingKey}">
+        <span class="${controlClass}" data-color-setting="${safeSettingKey}" data-color-empty="${safeColor ? 'false' : 'true'}">
             <button
                 type="button"
-                class="aspect-vocalia-color-swatch${value ? '' : ' aspect-vocalia-color-empty'}"
+                class="aspect-vocalia-color-swatch${safeColor ? '' : ' aspect-vocalia-color-empty'}"
                 data-color-swatch="${safeSettingKey}"
                 aria-label="Choose color"
-                title="${value ? `Current color: ${escapeHtml(value)}` : 'Theme default color'}"
+                title="${swatchTitle}"
                 ${swatchStyle}
+                ${disabledAttribute}
             ></button>
             <span class="aspect-vocalia-color-popover" data-color-popover="${safeSettingKey}">
-                <canvas
-                    class="aspect-vocalia-color-wheel"
-                    data-color-wheel="${safeSettingKey}"
-                    width="132"
-                    height="132"
-                    style="width:132px;height:132px;border-radius:999px;cursor:crosshair;"
-                    aria-label="Color wheel"
-                ></canvas>
-                <input
-                    id="${safeInputId}"
-                    class="text_pole aspect-vocalia-color-hex-input"
-                    type="text"
-                    value="${escapeHtml(value)}"
-                    placeholder="#rrggbb"
-                    spellcheck="false"
-                    data-color-hex="${safeSettingKey}"
-                >
+                <span class="aspect-vocalia-color-wheel-wrap">
+                    <canvas
+                        class="aspect-vocalia-color-wheel"
+                        data-color-wheel="${safeSettingKey}"
+                        width="132"
+                        height="132"
+                        aria-label="Color wheel"
+                    ></canvas>
+                    <span
+                        class="aspect-vocalia-color-preview"
+                        data-color-preview="${safeSettingKey}"
+                        title="Color preview"
+                        style="--aspect-vocalia-preview-color: ${safeColor || 'transparent'}"
+                    ></span>
+                </span>
+                <button
+                    type="button"
+                    class="menu_button aspect-vocalia-color-close"
+                    data-color-close="${safeSettingKey}"
+                    aria-label="Close color picker"
+                    title="Close"
+                >×</button>
+                <span class="aspect-vocalia-color-inputs">
+                    <label class="aspect-vocalia-color-field">
+                        <span class="aspect-vocalia-color-field-label">Brightness</span>
+                        <input
+                            class="text_pole aspect-vocalia-color-number-input aspect-vocalia-color-brightness-input"
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="1"
+                            inputmode="decimal"
+                            value="${escapeHtml(model.brightness)}"
+                            data-color-brightness="${safeSettingKey}"
+                            ${disabledAttribute}
+                        >
+                        <span class="aspect-vocalia-color-unit">%</span>
+                    </label>
+                    <label class="aspect-vocalia-color-field">
+                        <span class="aspect-vocalia-color-field-label">Alpha</span>
+                        <input
+                            class="text_pole aspect-vocalia-color-number-input aspect-vocalia-color-alpha-input"
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="1"
+                            inputmode="decimal"
+                            value="${escapeHtml(model.alpha)}"
+                            data-color-alpha="${safeSettingKey}"
+                            ${disabledAttribute}
+                        >
+                        <span class="aspect-vocalia-color-unit">%</span>
+                    </label>
+                    <label class="aspect-vocalia-color-field">
+                        <span class="aspect-vocalia-color-field-label">Hex</span>
+                        <input
+                            id="${safeInputId}"
+                            class="text_pole aspect-vocalia-color-hex-input"
+                            type="text"
+                            value="${escapeHtml(model.hex)}"
+                            placeholder="#RRGGBB"
+                            spellcheck="false"
+                            autocapitalize="none"
+                            data-color-hex="${safeSettingKey}"
+                            ${disabledAttribute}
+                        >
+                        <span class="aspect-vocalia-color-unit"></span>
+                    </label>
+                </span>
                 <button
                     type="button"
                     class="menu_button aspect-vocalia-color-clear"
                     data-color-clear="${safeSettingKey}"
+                    ${disabledAttribute}
                 >Default</button>
             </span>
         </span>`;
@@ -8777,14 +9266,103 @@ function hsvToRgb(hue, saturation, value = 1) {
     };
 }
 
+function rgbToHsv({ r, g, b }) {
+    const red = clampColorByte(r) / 255;
+    const green = clampColorByte(g) / 255;
+    const blue = clampColorByte(b) / 255;
+    const max = Math.max(red, green, blue);
+    const min = Math.min(red, green, blue);
+    const delta = max - min;
+
+    let hue = 0;
+
+    if (delta !== 0) {
+        if (max === red) {
+            hue = 60 * (((green - blue) / delta) % 6);
+        } else if (max === green) {
+            hue = 60 * (((blue - red) / delta) + 2);
+        } else {
+            hue = 60 * (((red - green) / delta) + 4);
+        }
+    }
+
+    if (hue < 0) hue += 360;
+
+    return {
+        h: hue,
+        s: max === 0 ? 0 : delta / max,
+        v: max,
+    };
+}
+
 function rgbToHex({ r, g, b }) {
     return `#${[r, g, b].map(value => {
-        const safe = Math.min(255, Math.max(0, Math.round(Number(value) || 0)));
+        const safe = clampColorByte(value);
         return safe.toString(16).padStart(2, '0');
     }).join('')}`;
 }
 
-function drawVocaliaColorWheel(canvas) {
+function clampVocaliaPercent(value, fallback = 100) {
+    const number = Number(value);
+    const safe = Number.isFinite(number) ? Math.round(number) : fallback;
+    return Math.min(100, Math.max(0, safe));
+}
+
+function getVocaliaColorPickerModelFromValue(value) {
+    const parsed = parseVocaliaColorValue(value) ?? { r: 255, g: 255, b: 255, a: 1 };
+    const hsv = rgbToHsv(parsed);
+
+    return {
+        hue: hsv.h,
+        saturation: Math.round(hsv.s * 100),
+        brightness: Math.round(hsv.v * 100),
+        alpha: Math.round(clampColorUnit(parsed.a, 1) * 100),
+        hex: rgbToHex(parsed).toUpperCase(),
+    };
+}
+
+function getVocaliaColorPickerModelFromControl(control) {
+    const hexInput = control?.querySelector('.aspect-vocalia-color-hex-input');
+    const alphaInput = control?.querySelector('.aspect-vocalia-color-alpha-input');
+    const brightnessInput = control?.querySelector('.aspect-vocalia-color-brightness-input');
+    const parsed = parseVocaliaHexColor(hexInput?.value) ?? { r: 255, g: 255, b: 255, a: 1 };
+    const hsv = rgbToHsv(parsed);
+
+    return {
+        hue: hsv.h,
+        saturation: Math.round(hsv.s * 100),
+        brightness: clampVocaliaPercent(brightnessInput?.value, Math.round(hsv.v * 100)),
+        alpha: clampVocaliaPercent(alphaInput?.value, 100),
+        hex: rgbToHex(parsed).toUpperCase(),
+    };
+}
+
+function getVocaliaColorValueFromModel(model) {
+    const rgb = hsvToRgb(model.hue, model.saturation / 100, model.brightness / 100);
+    return formatVocaliaColorValue({
+        ...rgb,
+        a: clampVocaliaPercent(model.alpha, 100) / 100,
+    });
+}
+
+function getVocaliaCheckerboardColor(x, y, size = 8) {
+    const checker = (Math.floor(x / size) + Math.floor(y / size)) % 2;
+    return checker
+        ? { r: 178, g: 178, b: 178 }
+        : { r: 232, g: 232, b: 232 };
+}
+
+function compositeRgbOverBackground(foreground, background, alpha) {
+    const a = clampColorUnit(alpha, 1);
+
+    return {
+        r: Math.round((foreground.r * a) + (background.r * (1 - a))),
+        g: Math.round((foreground.g * a) + (background.g * (1 - a))),
+        b: Math.round((foreground.b * a) + (background.b * (1 - a))),
+    };
+}
+
+function drawVocaliaColorWheel(canvas, model = null) {
     if (!(canvas instanceof HTMLCanvasElement)) return;
 
     const context = canvas.getContext('2d');
@@ -8796,6 +9374,8 @@ function drawVocaliaColorWheel(canvas) {
     const centerY = height / 2;
     const radius = Math.min(centerX, centerY) - 1;
     const image = context.createImageData(width, height);
+    const brightness = clampVocaliaPercent(model?.brightness, 100) / 100;
+    const alpha = clampVocaliaPercent(model?.alpha, 100) / 100;
 
     for (let y = 0; y < height; y += 1) {
         for (let x = 0; x < width; x += 1) {
@@ -8814,19 +9394,48 @@ function drawVocaliaColorWheel(canvas) {
 
             const hue = ((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360;
             const saturation = Math.min(1, distance / radius);
-            const rgb = hsvToRgb(hue, saturation, 1);
+            const rgb = hsvToRgb(hue, saturation, brightness);
+            const checkerboard = getVocaliaCheckerboardColor(x, y);
+            const composited = compositeRgbOverBackground(rgb, checkerboard, alpha);
 
-            image.data[offset + 0] = rgb.r;
-            image.data[offset + 1] = rgb.g;
-            image.data[offset + 2] = rgb.b;
+            image.data[offset + 0] = composited.r;
+            image.data[offset + 1] = composited.g;
+            image.data[offset + 2] = composited.b;
             image.data[offset + 3] = 255;
         }
     }
 
     context.putImageData(image, 0, 0);
+
+    if (!model) return;
+
+    const hueRadians = Number(model.hue || 0) * Math.PI / 180;
+    const saturationRadius = radius * Math.min(1, Math.max(0, Number(model.saturation || 0) / 100));
+    const markerX = centerX + Math.cos(hueRadians) * saturationRadius;
+    const markerY = centerY + Math.sin(hueRadians) * saturationRadius;
+
+    context.save();
+
+    // Thin outer visibility ring around the black selector.
+    context.beginPath();
+    context.arc(markerX, markerY, 3.75, 0, Math.PI * 2);
+    context.lineWidth = 0.75;
+    context.strokeStyle = '#ffffff';
+    context.stroke();
+
+    // Main selector ring: half the prior radius and half the prior stroke width.
+    context.beginPath();
+    context.arc(markerX, markerY, 3, 0, Math.PI * 2);
+    context.lineWidth = 1.5;
+    context.strokeStyle = '#000000';
+    context.stroke();
+
+    context.restore();
 }
 
-function getVocaliaColorFromWheelEvent(canvas, event) {
+function getVocaliaColorModelFromWheelEvent(canvas, event) {
+    const control = canvas.closest('.aspect-vocalia-color-control');
+    const baseModel = getVocaliaColorPickerModelFromControl(control);
     const rect = canvas.getBoundingClientRect();
     const x = Number(event.clientX) - rect.left;
     const y = Number(event.clientY) - rect.top;
@@ -8839,15 +9448,19 @@ function getVocaliaColorFromWheelEvent(canvas, event) {
 
     if (distance > radius) return null;
 
-    const hue = ((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360;
-    const saturation = Math.min(1, distance / radius);
-
-    return rgbToHex(hsvToRgb(hue, saturation, 1));
+    return {
+        ...baseModel,
+        hue: ((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360,
+        saturation: Math.round(Math.min(1, distance / radius) * 100),
+    };
 }
 
 function syncVocaliaColorPickerControl(settingKey) {
     const settings = getSettings();
-    const color = normalizeOptionalHexColor(settings[settingKey]);
+    const storedColor = normalizeOptionalHexColor(settings[settingKey]);
+    const disabledByDialogueColorizer = settingKey === 'dialogueTextColor' && isDialogueColorizerActive();
+    const color = disabledByDialogueColorizer ? '' : storedColor;
+    const model = getVocaliaColorPickerModelFromValue(color);
     const root = document.getElementById('aspect_vocalia_settings');
     if (!root) return;
 
@@ -8855,13 +9468,47 @@ function syncVocaliaColorPickerControl(settingKey) {
     if (!control) return;
 
     const swatch = control.querySelector('.aspect-vocalia-color-swatch');
+    const preview = control.querySelector('.aspect-vocalia-color-preview');
     const hexInput = control.querySelector('.aspect-vocalia-color-hex-input');
+    const alphaInput = control.querySelector('.aspect-vocalia-color-alpha-input');
+    const brightnessInput = control.querySelector('.aspect-vocalia-color-brightness-input');
+    const clearButton = control.querySelector('.aspect-vocalia-color-clear');
+    const canvas = control.querySelector('canvas.aspect-vocalia-color-wheel');
 
-    if (hexInput) hexInput.value = color;
+    control.dataset.colorEmpty = color ? 'false' : 'true';
+    control.classList.toggle('aspect-vocalia-color-control-disabled-by-dialogue-colorizer', disabledByDialogueColorizer);
+    control.classList.toggle('is-open', !disabledByDialogueColorizer && control.classList.contains('is-open'));
+    control.setAttribute('aria-disabled', String(disabledByDialogueColorizer));
+
+    if (hexInput) {
+        hexInput.value = model.hex;
+        hexInput.disabled = disabledByDialogueColorizer;
+    }
+
+    if (alphaInput) {
+        alphaInput.value = String(model.alpha);
+        alphaInput.disabled = disabledByDialogueColorizer;
+    }
+
+    if (brightnessInput) {
+        brightnessInput.value = String(model.brightness);
+        brightnessInput.disabled = disabledByDialogueColorizer;
+    }
+
+    if (clearButton) {
+        clearButton.disabled = disabledByDialogueColorizer;
+    }
+
+    if (preview) {
+        preview.style.setProperty('--aspect-vocalia-preview-color', color || 'transparent');
+    }
 
     if (swatch) {
+        swatch.disabled = disabledByDialogueColorizer;
         swatch.classList.toggle('aspect-vocalia-color-empty', !color);
-        swatch.title = color ? `Current color: ${color}` : 'Theme default color';
+        swatch.title = disabledByDialogueColorizer
+            ? 'Smart Dialogue Colorizer is active. Vocalia dialogue color is disabled and Smart Dialogue Colorizer controls dialogue colors.'
+            : color ? `Current color: ${color}` : 'Theme default color';
 
         if (color) {
             swatch.style.backgroundColor = color;
@@ -8869,14 +9516,57 @@ function syncVocaliaColorPickerControl(settingKey) {
             swatch.style.removeProperty('background-color');
         }
     }
+
+    if (canvas) {
+        drawVocaliaColorWheel(canvas, model);
+    }
+}
+
+function updateVocaliaColorPickerControlFromModel(control, model, { save = true } = {}) {
+    if (!control) return;
+
+    const settingKey = String(control.getAttribute('data-color-setting') ?? '');
+    if (!settingKey) return;
+
+    const color = getVocaliaColorValueFromModel(model);
+    const hex = rgbToHex(parseVocaliaColorValue(color) ?? { r: 255, g: 255, b: 255 }).toUpperCase();
+    const hexInput = control.querySelector('.aspect-vocalia-color-hex-input');
+    const alphaInput = control.querySelector('.aspect-vocalia-color-alpha-input');
+    const brightnessInput = control.querySelector('.aspect-vocalia-color-brightness-input');
+    const preview = control.querySelector('.aspect-vocalia-color-preview');
+    const swatch = control.querySelector('.aspect-vocalia-color-swatch');
+    const canvas = control.querySelector('canvas.aspect-vocalia-color-wheel');
+
+    control.dataset.colorEmpty = 'false';
+
+    if (hexInput) hexInput.value = hex;
+    if (alphaInput) alphaInput.value = String(clampVocaliaPercent(model.alpha, 100));
+    if (brightnessInput) brightnessInput.value = String(clampVocaliaPercent(model.brightness, 100));
+    if (preview) preview.style.setProperty('--aspect-vocalia-preview-color', color);
+
+    if (swatch) {
+        swatch.classList.remove('aspect-vocalia-color-empty');
+        swatch.style.backgroundColor = color;
+        swatch.title = `Current color: ${color}`;
+    }
+
+    if (canvas) drawVocaliaColorWheel(canvas, model);
+
+    if (save) {
+        setVocaliaSegmentColorSetting(settingKey, color);
+    }
 }
 
 function setVocaliaSegmentColorSetting(settingKey, value) {
+    if (settingKey === 'dialogueTextColor' && isDialogueColorizerActive()) {
+        syncVocaliaColorPickerControl(settingKey);
+        return;
+    }
+
     const settings = getSettings();
     const color = normalizeOptionalHexColor(value);
 
     settings[settingKey] = color;
-    syncVocaliaColorPickerControl(settingKey);
     saveSettings();
     renderAllVisibleOverlays();
 }
@@ -8917,10 +9607,52 @@ function closeVocaliaColorPickers(exceptControl = null) {
 
 function initializeVocaliaColorWheels(root = document) {
     root.querySelectorAll('canvas.aspect-vocalia-color-wheel').forEach(canvas => {
-        if (canvas.dataset.colorWheelRendered === 'true') return;
-        drawVocaliaColorWheel(canvas);
+        const control = canvas.closest('.aspect-vocalia-color-control');
+        const settingKey = String(control?.getAttribute('data-color-setting') ?? '');
+        const color = settingKey ? normalizeOptionalHexColor(getSettings()[settingKey]) : '';
+        const model = getVocaliaColorPickerModelFromValue(color);
+
+        drawVocaliaColorWheel(canvas, model);
         canvas.dataset.colorWheelRendered = 'true';
     });
+}
+
+function getVocaliaColorPickerEventElement(event) {
+    const rawTarget = event?.target;
+    const target = rawTarget instanceof Element
+        ? rawTarget
+        : rawTarget?.parentElement instanceof Element
+            ? rawTarget.parentElement
+            : null;
+
+    if (!target) return null;
+
+    return target.closest(
+        '#aspect_vocalia_settings .aspect-vocalia-color-control, ' +
+        '#aspect_vocalia_settings .aspect-vocalia-color-popover',
+    );
+}
+
+function isEventInsideVocaliaColorPicker(event) {
+    if (getVocaliaColorPickerEventElement(event)) return true;
+
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    return path.some(node => (
+        node instanceof Element
+        && !!node.closest?.(
+            '#aspect_vocalia_settings .aspect-vocalia-color-control, ' +
+            '#aspect_vocalia_settings .aspect-vocalia-color-popover',
+        )
+    ));
+}
+
+function isFocusInsideVocaliaColorPicker() {
+    const activeElement = document.activeElement;
+    return activeElement instanceof Element
+        && !!activeElement.closest(
+            '#aspect_vocalia_settings .aspect-vocalia-color-control, ' +
+            '#aspect_vocalia_settings .aspect-vocalia-color-popover',
+        );
 }
 
 function bindVocaliaColorPickerControls() {
@@ -8929,86 +9661,27 @@ function bindVocaliaColorPickerControls() {
 
     initializeVocaliaColorWheels(root);
 
-    root.addEventListener('click', event => {
-        const swatch = event.target.closest('.aspect-vocalia-color-swatch');
-        const clearButton = event.target.closest('.aspect-vocalia-color-clear');
-
-        if (swatch) {
-            event.preventDefault();
-            event.stopPropagation();
-
-            const control = swatch.closest('.aspect-vocalia-color-control');
-            const willOpen = !control.classList.contains('is-open');
-
-            closeVocaliaColorPickers(control);
-
-            control.classList.toggle('is-open', willOpen);
-            initializeVocaliaColorWheels(control);
-
-            if (willOpen) {
-                positionVocaliaColorPopover(control);
-            }
-
-            return;
-        }
-
-        if (clearButton) {
-            event.preventDefault();
-            event.stopPropagation();
-
-            const settingKey = String(clearButton.getAttribute('data-color-clear') ?? '');
-            if (!settingKey) return;
-
-            setVocaliaSegmentColorSetting(settingKey, '');
-
-            return;
-        }
-
-        if (!event.target.closest('.aspect-vocalia-color-control')) {
-            closeVocaliaColorPickers();
-        }
-    }, true);
-
-    root.addEventListener('input', event => {
-        const input = event.target.closest('.aspect-vocalia-color-hex-input');
-        if (!input) return;
-
-        const settingKey = String(input.getAttribute('data-color-hex') ?? '');
-        if (!settingKey) return;
-
-        const normalized = normalizeOptionalHexColor(input.value);
-        if (!normalized && String(input.value ?? '').trim()) return;
-
-        setVocaliaSegmentColorSetting(settingKey, normalized);
-    });
-
-    root.addEventListener('change', event => {
-        const input = event.target.closest('.aspect-vocalia-color-hex-input');
-        if (!input) return;
-
-        const settingKey = String(input.getAttribute('data-color-hex') ?? '');
-        if (!settingKey) return;
-
-        const normalized = normalizeOptionalHexColor(input.value);
-        input.value = normalized;
-
-        setVocaliaSegmentColorSetting(settingKey, normalized);
-    });
-
     root.addEventListener('pointerdown', event => {
-        const canvas = event.target.closest('canvas.aspect-vocalia-color-wheel');
+        const pickerElement = event.target.closest?.(
+            '.aspect-vocalia-color-control, .aspect-vocalia-color-popover',
+        );
+
+        if (!pickerElement) return;
+
+        event.stopPropagation();
+
+        const canvas = event.target.closest?.('canvas.aspect-vocalia-color-wheel');
         if (!canvas) return;
 
         event.preventDefault();
-        event.stopPropagation();
 
-        const settingKey = String(canvas.getAttribute('data-color-wheel') ?? '');
-        if (!settingKey) return;
+        const control = canvas.closest('.aspect-vocalia-color-control');
+        if (!control || control.classList.contains('aspect-vocalia-color-control-disabled-by-dialogue-colorizer')) return;
 
         const applyFromEvent = pointerEvent => {
-            const color = getVocaliaColorFromWheelEvent(canvas, pointerEvent);
-            if (!color) return;
-            setVocaliaSegmentColorSetting(settingKey, color);
+            const model = getVocaliaColorModelFromWheelEvent(canvas, pointerEvent);
+            if (!model) return;
+            updateVocaliaColorPickerControlFromModel(control, model);
         };
 
         applyFromEvent(event);
@@ -9025,15 +9698,156 @@ function bindVocaliaColorPickerControls() {
         document.addEventListener('pointercancel', pointerUp, true);
     }, true);
 
-    document.addEventListener('click', event => {
-        if (event.target.closest('#aspect_vocalia_settings .aspect-vocalia-color-control')) return;
+    root.addEventListener('click', event => {
+        const swatch = event.target.closest?.('.aspect-vocalia-color-swatch');
+        const closeButton = event.target.closest?.('.aspect-vocalia-color-close');
+        const clearButton = event.target.closest?.('.aspect-vocalia-color-clear');
+        const popover = event.target.closest?.('.aspect-vocalia-color-popover');
+
+        if (swatch) {
+            event.preventDefault();
+            event.stopPropagation();
+
+            if (swatch.disabled) return;
+
+            const control = swatch.closest('.aspect-vocalia-color-control');
+            if (!control) return;
+
+            const willOpen = !control.classList.contains('is-open');
+
+            closeVocaliaColorPickers(control);
+
+            control.classList.toggle('is-open', willOpen);
+            initializeVocaliaColorWheels(control);
+
+            if (willOpen) {
+                positionVocaliaColorPopover(control);
+            }
+
+            return;
+        }
+
+        if (closeButton) {
+            event.preventDefault();
+            event.stopPropagation();
+
+            closeButton.closest('.aspect-vocalia-color-control')?.classList.remove('is-open');
+            return;
+        }
+
+        if (clearButton) {
+            event.preventDefault();
+            event.stopPropagation();
+
+            if (clearButton.disabled) return;
+
+            const settingKey = String(clearButton.getAttribute('data-color-clear') ?? '');
+            if (!settingKey) return;
+
+            getSettings()[settingKey] = '';
+            saveSettings();
+            syncVocaliaColorPickerControl(settingKey);
+            renderAllVisibleOverlays();
+
+            return;
+        }
+
+        if (popover) {
+            event.stopPropagation();
+            return;
+        }
+
+        if (!event.target.closest?.('.aspect-vocalia-color-control')) {
+            closeVocaliaColorPickers();
+        }
+    }, true);
+
+    root.addEventListener('input', event => {
+        const input = event.target.closest?.(
+            '.aspect-vocalia-color-brightness-input, .aspect-vocalia-color-alpha-input, .aspect-vocalia-color-hex-input',
+        );
+
+        if (!input) return;
+
+        const control = input.closest('.aspect-vocalia-color-control');
+        if (!control || control.classList.contains('aspect-vocalia-color-control-disabled-by-dialogue-colorizer')) return;
+
+        const model = getVocaliaColorPickerModelFromControl(control);
+
+        if (input.classList.contains('aspect-vocalia-color-hex-input')) {
+            const parsed = parseVocaliaHexColor(input.value);
+            if (!parsed && String(input.value ?? '').trim()) return;
+        }
+
+        updateVocaliaColorPickerControlFromModel(control, model);
+    });
+
+    root.addEventListener('change', event => {
+        const input = event.target.closest?.(
+            '.aspect-vocalia-color-brightness-input, .aspect-vocalia-color-alpha-input, .aspect-vocalia-color-hex-input',
+        );
+
+        if (!input) return;
+
+        const control = input.closest('.aspect-vocalia-color-control');
+        if (!control || control.classList.contains('aspect-vocalia-color-control-disabled-by-dialogue-colorizer')) return;
+
+        const model = getVocaliaColorPickerModelFromControl(control);
+        updateVocaliaColorPickerControlFromModel(control, model);
+    });
+
+    document.addEventListener('pointerdown', event => {
+        if (event.target.closest?.('#aspect_vocalia_settings .aspect-vocalia-color-control')) return;
         closeVocaliaColorPickers();
     }, true);
 
-    window.addEventListener('resize', () => closeVocaliaColorPickers());
-    window.addEventListener('scroll', () => closeVocaliaColorPickers(), true);
+    window.addEventListener('resize', () => {
+        document.querySelectorAll('#aspect_vocalia_settings .aspect-vocalia-color-control.is-open')
+            .forEach(positionVocaliaColorPopover);
+    });
 
     root.dataset.colorPickersBound = 'true';
+}
+
+function isDialogueColorizerNode(node) {
+    if (!(node instanceof Element)) return false;
+
+    if ([
+        DIALOGUE_COLORIZER_SETTINGS_ELEMENT_ID,
+        DIALOGUE_COLORIZER_CHARACTER_STYLE_ID,
+        DIALOGUE_COLORIZER_PERSONA_STYLE_ID,
+    ].includes(node.id)) {
+        return true;
+    }
+
+    return !!node.querySelector?.([
+        `#${DIALOGUE_COLORIZER_SETTINGS_ELEMENT_ID}`,
+        `#${DIALOGUE_COLORIZER_CHARACTER_STYLE_ID}`,
+        `#${DIALOGUE_COLORIZER_PERSONA_STYLE_ID}`,
+    ].join(','));
+}
+
+function syncDialogueColorizerIntegrationState() {
+    syncVocaliaColorPickerControl('dialogueTextColor');
+    renderAllVisibleOverlays();
+}
+
+function setupDialogueColorizerIntegrationObserver() {
+    if (vocaliaDialogueColorizerObserver) return;
+
+    vocaliaDialogueColorizerObserver = new MutationObserver(records => {
+        const touchedDialogueColorizer = records.some(record => {
+            return [...record.addedNodes, ...record.removedNodes].some(isDialogueColorizerNode);
+        });
+
+        if (!touchedDialogueColorizer) return;
+        syncDialogueColorizerIntegrationState();
+    });
+
+    vocaliaDialogueColorizerObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+    });
 }
 
 function renderVocaliaInfoTip(key, label = 'More information') {
@@ -10099,6 +10913,8 @@ function injectSettingsUi() {
     addVocaliaInfoTipsToSettings();
     setupVocaliaInfoTooltips();
     bindVocaliaColorPickerControls();
+    setupDialogueColorizerIntegrationObserver();
+    syncDialogueColorizerIntegrationState();
 
     bindSettingsUi();
 }
