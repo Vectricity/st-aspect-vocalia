@@ -8366,18 +8366,49 @@ function installStyles() {
     styleElement = document.createElement('style');
     styleElement.id = 'aspect-vocalia-styles';
     styleElement.textContent = `
-        #aspect_vocalia_settings .aspect-vocalia-section-title {
-            width: 100%;
-            box-sizing: border-box;
-            padding: 0.45em 0.65em;
-            margin: 0.8em 0 0.45em;
-            border-radius: 4px;
-            background: #000;
-            color: #fff;
-            font-weight: 700;
-            letter-spacing: 0.02em;
-            text-transform: uppercase;
-        }
+        #aspect_vocalia_settings .aspect-vocalia-settings-tagline {
+    font: inherit;
+    font-size: 0.9em;
+    line-height: 1.2;
+    opacity: 0.75;
+    text-align: right;
+    margin: 0 0 8px;
+}
+
+#aspect_vocalia_settings .aspect-vocalia-section-title,
+#aspect_vocalia_settings .aspect-vocalia-popup-title {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.45em 0.65em;
+    margin: 0.8em 0 0.45em;
+    border-radius: 4px;
+    background: #000;
+    color: #fff;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+}
+
+#aspect_vocalia_settings .aspect-vocalia-popup-title {
+    position: relative;
+    margin: 0 0 0.65em;
+    padding-right: 2.75em;
+}
+
+#aspect_vocalia_settings .aspect-vocalia-popup-close {
+    position: absolute;
+    top: 1em;
+    right: 1em;
+    z-index: 1;
+    width: 1.85em;
+    min-width: 1.85em;
+    height: 1.85em;
+    padding: 0;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
 
         #aspect_vocalia_settings .aspect-vocalia-settings-section {
             margin-bottom: 0.65em;
@@ -8454,20 +8485,20 @@ function installStyles() {
         }
 
         #aspect_vocalia_settings .aspect-vocalia-popup {
-            position: fixed;
-            left: var(--aspect-vocalia-popup-left, 8px);
-            top: var(--aspect-vocalia-popup-top, 8px);
-            z-index: 2147483644;
-            display: none;
-            width: min(420px, calc(100vw - 16px));
-            max-height: calc(100vh - 16px);
-            overflow: auto;
-            padding: 0.75em;
-            border: 1px solid var(--SmartThemeBorderColor);
-            border-radius: 10px;
-            background: var(--SmartThemeBlurTintColor, rgba(28, 28, 28, 1));
-            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-        }
+    position: fixed;
+    left: var(--aspect-vocalia-popup-left, 8px);
+    top: var(--aspect-vocalia-popup-top, var(--aspect-vocalia-popup-safe-top, 8px));
+    z-index: 3006;
+    display: none;
+    width: min(420px, calc(100vw - 16px));
+    max-height: calc(100vh - var(--aspect-vocalia-popup-safe-top, 8px) - 8px);
+    overflow: auto;
+    padding: 0.75em;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 10px;
+    background: var(--SmartThemeBlurTintColor, rgba(28, 28, 28, 1));
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
 
         #aspect_vocalia_settings .aspect-vocalia-popup.aspect-vocalia-popup-open {
             display: block;
@@ -8546,8 +8577,25 @@ function installStyles() {
         }
 
         #aspect_vocalia_member_state_table .aspect-vocalia-member-omniscience-cell {
-            text-align: center;
-        }
+    text-align: center;
+}
+
+#aspect_vocalia_member_state_table {
+    table-layout: auto;
+}
+
+#aspect_vocalia_member_state_table .aspect-vocalia-member-status-cell,
+#aspect_vocalia_member_state_table .aspect-vocalia-member-status-heading {
+    width: 1%;
+    white-space: nowrap;
+}
+
+#aspect_vocalia_member_state_table .aspect_vocalia_member_status_select {
+    width: max-content;
+    min-width: max-content;
+    max-width: none;
+    white-space: nowrap;
+}
 
         .aspect-vocalia-array-list {
             display: grid;
@@ -8632,7 +8680,7 @@ function installStyles() {
 
         #aspect_vocalia_settings .aspect-vocalia-color-popover {
             position: fixed;
-            z-index: 2147483645;
+            z-index: 3007;
             display: none;
             grid-template-columns: auto minmax(9rem, 1fr);
             grid-template-areas:
@@ -10154,6 +10202,28 @@ function clampVocaliaNumber(value, min, max) {
     return Math.min(Math.max(value, min), max);
 }
 
+function getVocaliaPopupSafeTop() {
+    const topBar = document.querySelector('#top-bar');
+    const topBarBottom = topBar?.getBoundingClientRect?.().bottom;
+    return Math.max(8, Math.ceil(Number(topBarBottom) || 0) + 8);
+}
+
+function repositionOpenVocaliaPopup() {
+    const popup = document.querySelector(
+        '#aspect_vocalia_settings .aspect-vocalia-popup.aspect-vocalia-popup-open',
+    );
+
+    if (!popup?.id) return;
+
+    const button = document.querySelector(
+        `#aspect_vocalia_settings .aspect-vocalia-popup-button[aria-controls="${cssEscape(popup.id)}"]`,
+    );
+
+    if (button instanceof Element) {
+        positionVocaliaPopupInViewport($(popup), button);
+    }
+}
+
 function isEventInsideVocaliaPopupSystem(event) {
     const path = typeof event?.composedPath === 'function'
         ? event.composedPath()
@@ -10185,6 +10255,7 @@ function closeVocaliaPopups(exceptPopup = null) {
             popup.classList.remove('aspect-vocalia-popup-open');
             popup.style.removeProperty('--aspect-vocalia-popup-left');
             popup.style.removeProperty('--aspect-vocalia-popup-top');
+            popup.style.removeProperty('--aspect-vocalia-popup-safe-top');
         });
 
     document
@@ -10204,28 +10275,37 @@ function positionVocaliaPopupInViewport($popup, button) {
     if (!popupElement || !(button instanceof Element)) return;
 
     const margin = 8;
+    const safeTop = getVocaliaPopupSafeTop();
     const buttonRect = button.getBoundingClientRect();
 
+    popupElement.style.setProperty('--aspect-vocalia-popup-safe-top', `${safeTop}px`);
     popupElement.style.setProperty('--aspect-vocalia-popup-left', `${margin}px`);
-    popupElement.style.setProperty('--aspect-vocalia-popup-top', `${margin}px`);
+    popupElement.style.setProperty('--aspect-vocalia-popup-top', `${safeTop}px`);
 
     requestAnimationFrame(() => {
         if (!popupElement.classList.contains('aspect-vocalia-popup-open')) return;
 
-        const popupWidth = Math.min(popupElement.offsetWidth || 260, window.innerWidth - (margin * 2));
-        const popupHeight = Math.min(popupElement.offsetHeight || 0, window.innerHeight - (margin * 2));
+        const popupWidth = Math.min(
+            popupElement.offsetWidth || 260,
+            window.innerWidth - (margin * 2),
+        );
+
+        const popupHeight = Math.min(
+            popupElement.offsetHeight || 0,
+            window.innerHeight - safeTop - margin,
+        );
 
         const maxLeft = Math.max(margin, window.innerWidth - popupWidth - margin);
-        const maxTop = Math.max(margin, window.innerHeight - popupHeight - margin);
+        const maxTop = Math.max(safeTop, window.innerHeight - popupHeight - margin);
 
         const left = clampVocaliaNumber(buttonRect.left, margin, maxLeft);
-        let top = buttonRect.bottom + 4;
+        let top = Math.max(buttonRect.bottom + 4, safeTop);
 
-        if (top > maxTop && buttonRect.top - popupHeight - 4 >= margin) {
+        if (top > maxTop && buttonRect.top - popupHeight - 4 >= safeTop) {
             top = buttonRect.top - popupHeight - 4;
         }
 
-        top = clampVocaliaNumber(top, margin, maxTop);
+        top = clampVocaliaNumber(top, safeTop, maxTop);
 
         popupElement.style.setProperty('--aspect-vocalia-popup-left', `${Math.round(left)}px`);
         popupElement.style.setProperty('--aspect-vocalia-popup-top', `${Math.round(top)}px`);
@@ -10437,7 +10517,7 @@ function renderDiagnosticMemberRows() {
                     >
                 </td>
                 <td>${escapeHtml(allowanceText)}</td>
-                <td>
+                <td class="aspect-vocalia-member-status-cell">
                     <select class="text_pole aspect_vocalia_member_status_select" data-avatar="${escapeHtml(member.avatar)}">
                         ${renderStatusOptions(status)}
                     </select>
@@ -10635,6 +10715,12 @@ function injectSettingsUi() {
 
                                 <div id="aspect_vocalia_debug_popup" class="aspect-vocalia-popup">
                                     <div class="aspect-vocalia-popup-title">Debug Log</div>
+<button
+    type="button"
+    class="menu_button aspect-vocalia-popup-close"
+    aria-label="Close Debug Log"
+    title="Close"
+>×</button>
 
                                     <div class="aspect-vocalia-label aspect-vocalia-debug-status-label">Debug Status</div>
                                     <div class="aspect-vocalia-debug-status">
@@ -10804,6 +10890,12 @@ function injectSettingsUi() {
 
                                 <div id="aspect_vocalia_protocol_popup" class="aspect-vocalia-popup">
                                     <div class="aspect-vocalia-popup-title">Protocol Injection</div>
+<button
+    type="button"
+    class="menu_button aspect-vocalia-popup-close"
+    aria-label="Close Protocol Injection"
+    title="Close"
+>×</button>
                                     <div class="aspect-vocalia-protocol-preview">Edit the concise instruction templates Vocalia injects into the LLM prompt. Placeholders such as {{tagPrefix}}, {{allMembers}}, and {{maxParticipants}} are filled at generation time.</div>
                                     ${renderProtocolInjectionEditorFields()}
                                 </div>
@@ -10847,6 +10939,12 @@ function injectSettingsUi() {
 
                                 <div id="aspect_vocalia_status_popup" class="aspect-vocalia-popup">
                                     <div class="aspect-vocalia-popup-title">Status</div>
+<button
+    type="button"
+    class="menu_button aspect-vocalia-popup-close"
+    aria-label="Close Status"
+    title="Close"
+>×</button>
 
                                     <div class="aspect-vocalia-label aspect-vocalia-status-arrays-label">Overview</div>
                                     <div class="aspect-vocalia-array-list">
@@ -10867,7 +10965,7 @@ function injectSettingsUi() {
 												<th>Enabled</th>
 												<th>Omniscience</th>
 												<th>Responses</th>
-												<th>Status</th>
+												<th class="aspect-vocalia-member-status-heading">Status</th>
 											</tr>
                                         </thead>
                                         <tbody></tbody>
@@ -11097,18 +11195,30 @@ function bindSettingsUi() {
         toggleVocaliaPopup(this, '#aspect_vocalia_protocol_popup');
     });
 
+    $('#aspect_vocalia_settings').on('click', '.aspect-vocalia-popup-close', function (event) {
+        stopVocaliaPopupEvent(event);
+        closeVocaliaPopups();
+    });
+
     $('#aspect_vocalia_settings')
         .off('.aspectVocaliaPopupShield');
 
     $(document)
-        .off('pointerdown.aspectVocaliaPopups')
-        .on('pointerdown.aspectVocaliaPopups', function (event) {
-            if (isEventInsideVocaliaPopupSystem(event)) return;
-            closeVocaliaPopups();
-        });
+    .off('pointerdown.aspectVocaliaPopups keydown.aspectVocaliaPopups')
+    .on('pointerdown.aspectVocaliaPopups', function (event) {
+        if (isEventInsideVocaliaPopupSystem(event)) return;
+        closeVocaliaPopups();
+    })
+    .on('keydown.aspectVocaliaPopups', function (event) {
+        if (event.key !== 'Escape') return;
+        closeVocaliaPopups();
+    });
 
-    $(window)
-        .off('resize.aspectVocaliaPopups scroll.aspectVocaliaPopups');
+$(window)
+    .off('resize.aspectVocaliaPopups scroll.aspectVocaliaPopups')
+    .on('resize.aspectVocaliaPopups scroll.aspectVocaliaPopups', function () {
+        repositionOpenVocaliaPopup();
+    });
 
     $('#aspect_vocalia_member_state_table').on('change', '.aspect_vocalia_member_status_select', async function () {
         const avatar = String($(this).attr('data-avatar') ?? '');
